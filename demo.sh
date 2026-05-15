@@ -25,6 +25,8 @@ usage() {
   echo "Usage: $0 <command>"
   echo ""
   echo "Commands:"
+  echo "  preflight              Pre-meeting health check — verify all pods, links, and URLs"
+  echo ""
   echo "  produce [n]            Produce n order events to eu-west-1 (default: 10)"
   echo "  consume-source         Consume retail-orders from eu-west-1"
   echo "  consume-shadow         Consume retail-orders from eu-central-1"
@@ -54,6 +56,131 @@ rp_exec() {
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
+
+cmd_preflight() {
+  banner "Pre-flight Check"
+  info "Run this 10–15 minutes before the demo to confirm everything is healthy."
+  echo ""
+
+  local PASS=0
+  local FAIL=0
+
+  _chk() {
+    local label="$1"; shift
+    if "$@" &>/dev/null; then
+      ok "$label"
+      (( PASS++ )) || true
+    else
+      echo -e "${RED}✗ $label${NC}"
+      (( FAIL++ )) || true
+    fi
+  }
+
+  # ── kubectl contexts reachable ───────────────────────────────────────────
+  step "kubectl contexts:"
+  _chk "context $CONTEXT_A reachable" \
+    kubectl --context "$CONTEXT_A" cluster-info
+  _chk "context $CONTEXT_B reachable" \
+    kubectl --context "$CONTEXT_B" cluster-info
+  echo ""
+
+  # ── Redpanda pods ────────────────────────────────────────────────────────
+  step "Redpanda brokers:"
+  for broker in 0 1 2; do
+    _chk "eu-west-1    redpanda-$broker Running" \
+      kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$broker" \
+        --field-selector=status.phase=Running --no-headers
+    _chk "eu-central-1 redpanda-$broker Running" \
+      kubectl --context "$CONTEXT_B" -n redpanda get pod "redpanda-$broker" \
+        --field-selector=status.phase=Running --no-headers
+  done
+  echo ""
+
+  # ── Support services ─────────────────────────────────────────────────────
+  step "Support services:"
+  _chk "eu-west-1    Console Running" \
+    kubectl --context "$CONTEXT_A" -n redpanda get pod -l app.kubernetes.io/name=console \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-central-1 Console Running" \
+    kubectl --context "$CONTEXT_B" -n redpanda get pod -l app.kubernetes.io/name=console \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-west-1    Mosquitto MQTT broker Running" \
+    kubectl --context "$CONTEXT_A" -n redpanda get pod -l app=mosquitto \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-west-1    MQTT→Kafka bridge Running" \
+    kubectl --context "$CONTEXT_A" -n redpanda get pod -l app=connect-mqtt-bridge \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-west-1    Python retail consumer Running" \
+    kubectl --context "$CONTEXT_A" -n redpanda get pod -l app=python-retail-consumer \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-central-1 RabbitMQ Running" \
+    kubectl --context "$CONTEXT_B" -n redpanda get pod -l app=rabbitmq \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-central-1 Kafka→AMQP bridge Running" \
+    kubectl --context "$CONTEXT_B" -n redpanda get pod -l app=connect-amqp-bridge \
+      --field-selector=status.phase=Running --no-headers
+  _chk "eu-central-1 AMQP consumer Running" \
+    kubectl --context "$CONTEXT_B" -n redpanda get pod -l app=amqp-iot-consumer \
+      --field-selector=status.phase=Running --no-headers
+  echo ""
+
+  # ── ShadowLink ───────────────────────────────────────────────────────────
+  step "ShadowLink:"
+  SL_STATE=$(kubectl --context "$CONTEXT_B" -n redpanda get shadowlink "$SHADOW_LINK" \
+    -o jsonpath='{.status.state}' 2>/dev/null || echo "not found")
+  if [[ "$SL_STATE" == "active" ]]; then
+    ok "ShadowLink '$SHADOW_LINK' is active"
+    (( PASS++ )) || true
+  else
+    echo -e "${RED}✗ ShadowLink '$SHADOW_LINK' state: $SL_STATE${NC}"
+    (( FAIL++ )) || true
+  fi
+  echo ""
+
+  # ── Topics ───────────────────────────────────────────────────────────────
+  step "Topics:"
+  for t in retail-orders iot-events; do
+    _chk "eu-west-1    topic '$t' exists" \
+      rp_exec "$CONTEXT_A" rpk topic describe "$t"
+    _chk "eu-central-1 topic '$t' shadow exists" \
+      rp_exec "$CONTEXT_B" rpk topic describe "$t"
+  done
+  echo ""
+
+  # ── URLs ─────────────────────────────────────────────────────────────────
+  step "Service URLs (open these in your browser before the demo):"
+  CONSOLE_A=$(kubectl --context "$CONTEXT_A" -n redpanda get svc console \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  CONSOLE_B=$(kubectl --context "$CONTEXT_B" -n redpanda get svc console \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  GRAFANA_A=$(kubectl --context "$CONTEXT_A" -n monitoring get svc kube-prometheus-stack-grafana \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  GRAFANA_B=$(kubectl --context "$CONTEXT_B" -n monitoring get svc kube-prometheus-stack-grafana \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+
+  [[ -n "$CONSOLE_A" ]] && info "  Console eu-west-1   : http://$CONSOLE_A:8080" \
+    || echo -e "  ${RED}Console eu-west-1   : LoadBalancer not ready${NC}"
+  [[ -n "$CONSOLE_B" ]] && info "  Console eu-central-1: http://$CONSOLE_B:8080" \
+    || echo -e "  ${RED}Console eu-central-1: LoadBalancer not ready${NC}"
+  [[ -n "$GRAFANA_A" ]] && info "  Grafana eu-west-1   : http://$GRAFANA_A  (admin / prom-operator)" \
+    || echo -e "  ${RED}Grafana eu-west-1   : LoadBalancer not ready${NC}"
+  [[ -n "$GRAFANA_B" ]] && info "  Grafana eu-central-1: http://$GRAFANA_B  (admin / prom-operator)" \
+    || echo -e "  ${RED}Grafana eu-central-1: LoadBalancer not ready${NC}"
+  echo ""
+
+  # ── Summary ──────────────────────────────────────────────────────────────
+  TOTAL=$(( PASS + FAIL ))
+  if [[ $FAIL -eq 0 ]]; then
+    banner "All $TOTAL checks passed — good to go"
+  else
+    echo -e "\n${RED}${BOLD}$FAIL / $TOTAL checks failed — investigate before starting the demo${NC}\n"
+    echo "Quick fixes:"
+    echo "  Pod not Running   → kubectl --context <ctx> -n redpanda describe pod <name>"
+    echo "  ShadowLink broken → kubectl --context $CONTEXT_B -n redpanda describe shadowlink $SHADOW_LINK"
+    echo "  Topic missing     → ./demo.sh status"
+    exit 1
+  fi
+}
 
 cmd_produce() {
   local n=${1:-10}
@@ -675,6 +802,7 @@ cmd_restore() {
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 case "${1:-}" in
+  preflight)      cmd_preflight ;;
   produce)        cmd_produce "${2:-10}" ;;
   consume-source) cmd_consume_source ;;
   consume-shadow) cmd_consume_shadow ;;
