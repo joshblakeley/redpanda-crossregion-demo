@@ -1,0 +1,12 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Console
+metadata:
+  name: console
+  namespace: redpanda
+spec:
+  cluster:
+    clusterRef:
+      name: redpanda
+  replicaCount: 1
+  service:
+    type: LoadBalancer

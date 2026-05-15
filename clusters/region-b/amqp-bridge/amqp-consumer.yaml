@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amqp-consumer-script
+  namespace: redpanda
+data:
+  consumer.py: |
+    import json, os, signal, sys
+    from datetime import datetime, timezone
+    import pika
+
+    AMQP_URL    = os.environ.get("AMQP_URL",          "amqp://guest:guest@rabbitmq.redpanda.svc.cluster.local:5672/")
+    EXCHANGE    = os.environ.get("AMQP_EXCHANGE",      "iot-events")
+    QUEUE       = os.environ.get("AMQP_QUEUE",         "iot-events-consumer")
+    ROUTING_KEY = os.environ.get("AMQP_ROUTING_KEY",   "iot-events")
+
+    def shutdown(signum, frame):
+        print("\n[amqp-consumer] Shutting down...", flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    def on_message(channel, method, properties, body):
+        ts  = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        key = method.routing_key
+        try:
+            value = json.loads(body.decode("utf-8"))
+            print(f"[{ts}] routing_key={key}", flush=True)
+            print(f"         {json.dumps(value)}", flush=True)
+        except Exception:
+            print(f"[{ts}] raw: {body}", flush=True)
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+
+    params = pika.URLParameters(AMQP_URL)
+    params.heartbeat = 60
+    connection = pika.BlockingConnection(params)
+    channel    = connection.channel()
+
+    channel.exchange_declare(exchange=EXCHANGE, exchange_type="direct", durable=True)
+    channel.queue_declare(queue=QUEUE, durable=True)
+    channel.queue_bind(exchange=EXCHANGE, queue=QUEUE, routing_key=ROUTING_KEY)
+    channel.basic_qos(prefetch_count=10)
+    channel.basic_consume(queue=QUEUE, on_message_callback=on_message)
+
+    print(f"[amqp-consumer] broker   : {AMQP_URL}", flush=True)
+    print(f"[amqp-consumer] exchange : {EXCHANGE} (direct)", flush=True)
+    print(f"[amqp-consumer] queue    : {QUEUE}", flush=True)
+    print(f"[amqp-consumer] protocol : AMQP 0.9.1 (pika)", flush=True)
+    print(f"[amqp-consumer] Waiting for messages...\n", flush=True)
+
+    try:
+        channel.start_consuming()
+    except KeyboardInterrupt:
+        channel.stop_consuming()
+    finally:
+        connection.close()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amqp-iot-consumer
+  namespace: redpanda
+  labels:
+    app: amqp-iot-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amqp-iot-consumer
+  template:
+    metadata:
+      labels:
+        app: amqp-iot-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - pip install pika --quiet --disable-pip-version-check 2>/dev/null && python /app/consumer.py
+          env:
+            - name: AMQP_URL
+              value: amqp://guest:guest@rabbitmq.redpanda.svc.cluster.local:5672/
+            - name: AMQP_EXCHANGE
+              value: iot-events
+            - name: AMQP_QUEUE
+              value: iot-events-consumer
+            - name: AMQP_ROUTING_KEY
+              value: iot-events
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: amqp-consumer-script

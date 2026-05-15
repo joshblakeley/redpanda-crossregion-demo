@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: connect-mqtt-bridge-config
+  namespace: redpanda
+data:
+  pipeline.yaml: |
+    input:
+      mqtt:
+        urls:
+          - tcp://mosquitto.redpanda.svc.cluster.local:1883
+        topics:
+          - iot/#
+        client_id: rp-connect-mqtt-bridge
+        qos: 1
+        connect_timeout: 30s
+        keepalive: 30
+
+    pipeline:
+      processors:
+        - mapping: |
+            let parts = meta("mqtt_topic").split("/")
+            root = {
+              "source":     "mqtt",
+              "mqtt_topic": meta("mqtt_topic"),
+              "region":     $parts.index(1),
+              "asset_type": $parts.index(2),
+              "asset_id":   $parts.index(3),
+              "event_type": $parts.index(4),
+              "payload":    this,
+              "ingested_at": now().string()
+            }
+
+    output:
+      kafka_franz:
+        seed_brokers:
+          - redpanda-0.redpanda.redpanda.svc.cluster.local:9092
+        topic: iot-events
+        tls:
+          enabled: true
+          root_cas_file: /etc/redpanda-certs/ca.crt
+        metadata:
+          include_patterns:
+            - mqtt_topic
+
+    logger:
+      level: INFO
+      format: json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect-mqtt-bridge
+  namespace: redpanda
+  labels:
+    app: connect-mqtt-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: connect-mqtt-bridge
+  template:
+    metadata:
+      labels:
+        app: connect-mqtt-bridge
+    spec:
+      containers:
+        - name: connect
+          image: docker.redpanda.com/redpandadata/connect:latest
+          args: ["run", "/etc/connect/pipeline.yaml"]
+          volumeMounts:
+            - name: pipeline-config
+              mountPath: /etc/connect
+            - name: redpanda-certs
+              mountPath: /etc/redpanda-certs
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            - name: CONNECT_LOG_LEVEL
+              value: INFO
+      volumes:
+        - name: pipeline-config
+          configMap:
+            name: connect-mqtt-bridge-config
+        - name: redpanda-certs
+          secret:
+            secretName: redpanda-default-root-certificate
+            items:
+              - key: ca.crt
+                path: ca.crt

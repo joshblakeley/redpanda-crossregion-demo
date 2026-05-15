@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: connect-amqp-bridge-config
+  namespace: redpanda
+data:
+  pipeline.yaml: |
+    input:
+      kafka_franz:
+        seed_brokers:
+          - redpanda-0.redpanda.redpanda.svc.cluster.local:9092
+        topics:
+          - iot-events
+        consumer_group: amqp-bridge-consumer
+        tls:
+          enabled: true
+          root_cas_file: /etc/redpanda-certs/ca.crt
+
+    output:
+      amqp_0_9:
+        urls:
+          - amqp://guest:guest@rabbitmq.redpanda.svc.cluster.local:5672/
+        exchange: iot-events
+        exchange_declare:
+          enabled: true
+          type: direct
+          durable: true
+        key: iot-events
+        persistent: true
+
+    logger:
+      level: INFO
+      format: json
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect-amqp-bridge
+  namespace: redpanda
+  labels:
+    app: connect-amqp-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: connect-amqp-bridge
+  template:
+    metadata:
+      labels:
+        app: connect-amqp-bridge
+    spec:
+      containers:
+        - name: connect
+          image: docker.redpanda.com/redpandadata/connect:latest
+          args: ["run", "/etc/connect/pipeline.yaml"]
+          volumeMounts:
+            - name: pipeline-config
+              mountPath: /etc/connect
+            - name: redpanda-certs
+              mountPath: /etc/redpanda-certs
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            - name: CONNECT_LOG_LEVEL
+              value: INFO
+      volumes:
+        - name: pipeline-config
+          configMap:
+            name: connect-amqp-bridge-config
+        - name: redpanda-certs
+          secret:
+            secretName: redpanda-default-root-certificate
+            items:
+              - key: ca.crt
+                path: ca.crt

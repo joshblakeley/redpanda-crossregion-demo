@@ -1,0 +1,40 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: rp-demo-eu-west-1
+  region: eu-west-1
+  version: "1.32"
+
+accessConfig:
+  authenticationMode: API_AND_CONFIG_MAP
+
+kubernetesNetworkConfig:
+  ipFamily: IPv4
+
+addons:
+  - name: vpc-cni
+    resolveConflicts: overwrite
+  - name: coredns
+    resolveConflicts: overwrite
+  - name: kube-proxy
+    resolveConflicts: overwrite
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: redpanda
+    instanceType: m7gd.large
+    amiFamily: AmazonLinux2023
+    desiredCapacity: 3
+    minSize: 3
+    maxSize: 3
+    privateNetworking: false
+    volumeSize: 50
+    volumeType: gp3
+    labels:
+      role: redpanda
+    tags:
+      demo: redpanda
+      region-role: primary
