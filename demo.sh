@@ -45,7 +45,7 @@ usage() {
   echo ""
   echo "  upgrade                Rolling cluster upgrade — zero message loss with live producer"
   echo "  quotas                 Multi-tenancy: ACLs, per-client throughput quotas, blast radius"
-  echo "  routing                Data residency routing: cn- topics stay local, eu- replicate globally"
+  echo "  routing                Data residency routing: regional- topics stay local, global topics replicate"
   echo ""
   echo "  chaos                  Kill broker-0 on eu-west-1, measure RTO for self-healing"
   echo "  failover               Promote eu-central-1 shadow to primary (IRREVERSIBLE)"
@@ -88,14 +88,17 @@ cmd_preflight() {
   echo ""
 
   # ── Redpanda pods ────────────────────────────────────────────────────────
+  _pod_running() {
+    local ctx="$1" pod="$2"
+    [[ "$(kubectl --context "$ctx" -n redpanda get pod "$pod" \
+          -o jsonpath='{.status.phase}' 2>/dev/null)" == "Running" ]]
+  }
   step "Redpanda brokers:"
   for broker in 0 1 2; do
     _chk "eu-west-1    redpanda-$broker Running" \
-      kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$broker" \
-        --field-selector=status.phase=Running --no-headers
+      _pod_running "$CONTEXT_A" "redpanda-$broker"
     _chk "eu-central-1 redpanda-$broker Running" \
-      kubectl --context "$CONTEXT_B" -n redpanda get pod "redpanda-$broker" \
-        --field-selector=status.phase=Running --no-headers
+      _pod_running "$CONTEXT_B" "redpanda-$broker"
   done
   echo ""
 
@@ -189,33 +192,47 @@ cmd_produce_large() {
   banner "Large Payload Support — 10MB Message"
   step "Cluster : $CONTEXT_A (eu-west-1)"
   step "Topic   : $TOPIC"
-  info "RFI Q&A states: 'some publishers up to 10MB'. Demonstrating Redpanda handles it."
+  info "Demonstrating large payload support — up to 10MB messages handled natively."
   echo ""
 
-  step "Generating a ~10MB payload..."
+  # ── 1. Bump cluster max message size ──────────────────────────────────────
+  step "1. Configuring cluster to accept large messages (kafka_batch_max_bytes = 11MB)..."
+  rp_exec "$CONTEXT_A" rpk cluster config set kafka_batch_max_bytes 11534336 2>&1
+  ok "Cluster max message size set to 11MB"
+  info "  (config change takes effect immediately — no restart required)"
+  echo ""
+
+  # ── 2. Generate payload ───────────────────────────────────────────────────
+  step "2. Generating a ~10MB payload..."
   local tmpfile
   tmpfile=$(mktemp)
-  # Build ~10MB JSON: base64-encoded block padded to size + metadata
+  # Build ~10MB JSON: base64-encoded random block + metadata
+  # Use bash string slice to truncate (avoids SIGPIPE from head -c in pipeline)
   local pad
-  pad=$(dd if=/dev/urandom bs=7500000 count=1 2>/dev/null | base64 | tr -d '\n' | head -c 9900000)
+  pad=$(dd if=/dev/urandom bs=7500000 count=1 2>/dev/null | base64 | tr -d '\n')
+  pad="${pad:0:9900000}"
   local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  printf '{"type":"large-payload-test","size_bytes":10000000,"ts":"%s","data":"%s"}' \
-    "$ts" "${pad:0:9900000}" > "$tmpfile"
+  # rpk produce reads newline-delimited records — trailing \n is required
+  printf '{"type":"large-payload-test","size_bytes":10000000,"ts":"%s","data":"%s"}\n' \
+    "$ts" "$pad" > "$tmpfile"
   local actual_size; actual_size=$(wc -c < "$tmpfile" | tr -d ' ')
   info "  Payload size: $actual_size bytes (~$(( actual_size / 1024 / 1024 ))MB)"
   echo ""
 
-  step "Producing to $TOPIC..."
+  # ── 3. Produce ────────────────────────────────────────────────────────────
+  step "3. Producing to $TOPIC..."
   kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
-    rpk topic produce "$TOPIC" --key "large-payload" < "$tmpfile" 2>&1
+    rpk topic produce "$TOPIC" --key "large-payload" \
+    --max-message-bytes 11534336 < "$tmpfile" 2>&1
   rm -f "$tmpfile"
   echo ""
 
-  step "Confirming message was written (high-watermark increment):"
+  # ── 4. Confirm ────────────────────────────────────────────────────────────
+  step "4. Confirming message was written (high-watermark increment):"
   rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>&1
   echo ""
   ok "10MB payload produced and confirmed."
-  info "Redpanda supports configurable max message sizes — this satisfies the RFI Q&A requirement."
+  info "Redpanda supports configurable max message sizes — no special broker deployment needed."
 }
 
 cmd_produce() {
@@ -256,8 +273,7 @@ cmd_consume_source() {
   kubectl --context "$CONTEXT_A" -n redpanda exec -it redpanda-0 -c redpanda -- \
     rpk topic consume "$TOPIC" \
     --group "$GROUP" \
-    --format '%v\n' \
-    --print-offset
+    --format '%v\n'
 }
 
 cmd_consume_shadow() {
@@ -271,8 +287,7 @@ cmd_consume_shadow() {
   kubectl --context "$CONTEXT_B" -n redpanda exec -it redpanda-0 -c redpanda -- \
     rpk topic consume "$TOPIC" \
     --group "$GROUP" \
-    --format '%v\n' \
-    --print-offset
+    --format '%v\n'
 }
 
 cmd_consume_both() {
@@ -283,15 +298,13 @@ cmd_consume_both() {
   kubectl --context "$CONTEXT_A" -n redpanda exec -it redpanda-0 -c redpanda -- \
     rpk topic consume "$TOPIC" \
     --group "$GROUP-source" \
-    --format "[eu-west-1]  %v\n" \
-    --print-offset &
+    --format "[eu-west-1]  %v\n" &
   PID_A=$!
 
   kubectl --context "$CONTEXT_B" -n redpanda exec -it redpanda-0 -c redpanda -- \
     rpk topic consume "$TOPIC" \
     --group "$GROUP-shadow" \
-    --format "[eu-central-1] %v\n" \
-    --print-offset &
+    --format "[eu-central-1] %v\n" &
   PID_B=$!
 
   trap "kill $PID_A $PID_B 2>/dev/null; exit 0" INT TERM
@@ -612,45 +625,47 @@ cmd_upgrade() {
     done
   ) &
   PROD_PID=$!
-  trap "kill $PROD_PID 2>/dev/null; trap - EXIT" EXIT
+  trap "kill $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
   ok "Producer running in background (PID $PROD_PID)"
   echo ""
 
   step "2. Pre-upgrade baseline..."
   rp_exec "$CONTEXT_A" rpk cluster health 2>&1
   PRE_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
-    | awk 'NR>1 {sum += $6} END {print sum+0}')
+    | awk 'NR>1 {sum += $NF} END {print sum+0}')
   info "  High-watermark before upgrade: $PRE_HWM"
   echo ""
 
-  step "3. Applying upgrade annotation to Redpanda CR..."
-  info "  (Operator detects the change and begins coordinated rolling restart)"
-  kubectl --context "$CONTEXT_A" -n redpanda annotate redpanda redpanda \
-    "demo.redpanda.com/upgrade-trigger=$(date +%s)" --overwrite 2>&1
+  step "3. Triggering rolling restart via Operator (kubectl rollout restart)..."
+  info "  In production this is triggered by a version bump in the Redpanda CR YAML — Git PR → Operator."
+  info "  For the demo we trigger it directly:"
+  kubectl --context "$CONTEXT_A" -n redpanda rollout restart statefulset/redpanda 2>&1
   UPGRADE_START=$SECONDS
   echo ""
 
   step "4. Watching broker-by-broker rolling restart..."
-  info "  Operator: drain → restart → verify health → proceed to next broker"
+  info "  StatefulSet restarts pods one at a time: drain → terminate → restart → health-check → next"
   echo ""
   for BROKER in 0 1 2; do
     info "  ── broker redpanda-$BROKER ──"
-    CYCLED=false
-    for _ in $(seq 1 30); do
+    # Phase 1: wait for pod to start cycling (go not-ready or disappear)
+    SEEN_DOWN=false
+    for _ in $(seq 1 24); do
       READY=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
-        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
       PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+        -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
       ELAPSED=$(( SECONDS - UPGRADE_START ))
       printf "  %3ds  redpanda-$BROKER  phase=%-10s  ready=%s\n" "$ELAPSED" "$PHASE" "$READY"
-      if [[ "$READY" == "True" && "$PHASE" == "Running" ]]; then
-        ok "    redpanda-$BROKER healthy — proceeding"
-        CYCLED=true
+      if [[ "$READY" != "True" || "$PHASE" != "Running" ]]; then
+        SEEN_DOWN=true
+      fi
+      if [[ "$SEEN_DOWN" == "true" && "$READY" == "True" && "$PHASE" == "Running" ]]; then
+        ok "    redpanda-$BROKER restarted and healthy — proceeding"
         break
       fi
       sleep 5
     done
-    [[ "$CYCLED" == "false" ]] && info "  (broker may not have cycled yet — check cluster health)"
   done
   echo ""
 
@@ -659,9 +674,9 @@ cmd_upgrade() {
   rp_exec "$CONTEXT_A" rpk cluster health 2>&1
   echo ""
   POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
-    | awk 'NR>1 {sum += $6} END {print sum+0}')
+    | awk 'NR>1 {sum += $NF} END {print sum+0}')
   MSGS_DURING=$(( POST_HWM - PRE_HWM ))
-  kill $PROD_PID 2>/dev/null
+  kill $PROD_PID 2>/dev/null || true
   trap - EXIT
 
   ELAPSED=$(( SECONDS - UPGRADE_START ))
@@ -675,12 +690,11 @@ cmd_upgrade() {
   ok "  handled automatically by the broker"
   ok "═══════════════════════════════════════════"
   echo ""
-  info "For Nihar: 'Reducing operational costs by 25%' — every upgrade, every patch,"
-  info "every scale event is fully automated. Your 16-person team doesn't need to"
-  info "become infrastructure specialists."
+  info "Cost angle: every upgrade, every patch, every scale event is fully automated —"
+  info "operator-driven platform management reduces infrastructure toil significantly."
   info ""
-  info "For Björn: The full environment is reproducible from a Git repo — every change"
-  info "is a PR, every state is auditable. Governance for the entire developer community."
+  info "Governance angle: the full environment is reproducible from a Git repo — every"
+  info "change is a PR, every state is auditable. Full audit trail for the platform."
 }
 
 # ── Multi-tenancy / blast radius demo ─────────────────────────────────────────
@@ -692,7 +706,6 @@ cmd_quotas() {
   banner "Multi-Tenancy & Blast Radius Control"
   info "Shared platform: 100+ producers, 500–1,000 consumers, 50+ markets."
   info "Tenant isolation, per-client throughput quotas, and blast radius containment."
-  info "Section 5.3 of the demo requirements explicitly asks for this."
   echo ""
 
   step "1. Creating a service account for tenant isolation..."
@@ -723,18 +736,18 @@ cmd_quotas() {
 
   step "5. Setting per-client throughput quotas (throughput-based blast radius cap)..."
   rp_exec "$CONTEXT_A" rpk cluster quotas alter \
-    --name "client-id:$TENANT" \
-    --producer-byte-rate 5242880 \
-    --consumer-byte-rate 10485760 2>&1 || \
-    info "  (quota command syntax varies by version — quotas are set via rpk cluster quotas)"
+    --name "client-id=$TENANT" \
+    --add "producer_byte_rate=5242880" \
+    --add "consumer_byte_rate=10485760" 2>&1 || \
+    info "  (quota command syntax varies by version — quotas are set via rpk cluster quotas alter)"
   echo ""
   info "  Producer cap : 5 MB/s  — prevents one tenant from saturating ingress"
   info "  Consumer cap : 10 MB/s — bounded read throughput per tenant"
-  info "  A misconfigured producer from one market cannot impact 49 other markets."
+  info "  A misconfigured producer from one team cannot impact other teams."
   echo ""
 
   step "6. Rate limiting summary:"
-  rp_exec "$CONTEXT_A" rpk cluster quotas list 2>&1 | head -20 || \
+  rp_exec "$CONTEXT_A" rpk cluster quotas describe 2>&1 | head -20 || \
     info "  (see Redpanda Console → Security for quota overview)"
   echo ""
 
@@ -762,7 +775,7 @@ cmd_routing() {
   info " and no record.\" — Segment 6 framing"
   echo ""
   info "Filter policy (clusters/region-b/shadowlink.yaml — committed to Git):"
-  info "  EXCLUDE topics prefixed 'cn-'  → China data stays in China (Cyber Law)"
+  info "  EXCLUDE topics prefixed 'regional-'  → regional data stays in origin region"
   info "  INCLUDE everything else         → EU/global topics replicate everywhere"
   echo ""
 
@@ -839,8 +852,8 @@ cmd_routing() {
   info "  global-*   topics → replicated to all regions"
   info "  regional-* topics → scoped to origin region only"
   info ""
-  info "For Martin (built the Solace mesh): policy-as-code beats a routing UI"
-  info "For Nihar: governance is part of SL1 platform requirements"
+  info "Policy-as-code beats a routing UI — every change is a PR with reviewer + audit trail"
+  info "Data residency enforcement at broker layer satisfies regulatory requirements automatically"
   info ""
   info "To clean up:"
   info "  kubectl --context $CONTEXT_A -n redpanda exec redpanda-0 -c redpanda -- rpk topic delete $EU_TOPIC $CN_TOPIC"
@@ -859,8 +872,8 @@ cmd_chaos() {
   echo ""
 
   step "2. ShadowLink lag before kill:"
-  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-topic 2>&1 | \
-    grep -E "NAME|LAG|PARTITION" | head -20
+  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
+    grep -E "^Name:|PARTITION|SRC_LSO" | head -20
   echo ""
 
   step "3. Cluster health before kill:"
@@ -878,10 +891,11 @@ cmd_chaos() {
   RECOVERED=false
   while true; do
     ELAPSED=$(( SECONDS - CHAOS_START ))
-    HEALTH=$(rp_exec "$CONTEXT_A" rpk cluster health 2>/dev/null | grep "Healthy:" || echo "Healthy: false")
+    HEALTH=$(rp_exec "$CONTEXT_A" rpk cluster health 2>/dev/null | \
+      awk '/^Healthy:/{print $2}' || echo "false")
     POD_PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod redpanda-0 \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
-    echo -e "  ${ELAPSED}s — pod: ${POD_PHASE} | ${HEALTH}"
+    echo -e "  ${ELAPSED}s — pod: ${POD_PHASE} | Healthy: ${HEALTH}"
     if echo "$HEALTH" | grep -q "true" && [[ "$POD_PHASE" == "Running" ]]; then
       RECOVERED=true
       break
@@ -898,8 +912,8 @@ cmd_chaos() {
     ok "Broker recovered in ${RTO}s"
     echo ""
     step "5. ShadowLink lag after recovery (should be 0 or near-0):"
-    rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-topic 2>&1 | \
-      grep -E "NAME|LAG|PARTITION" | head -20
+    rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
+      grep -E "^Name:|PARTITION|SRC_LSO" | head -20
     echo ""
     ok "HA demo complete — no manual intervention, no data loss, RTO = ${RTO}s"
   fi
@@ -918,8 +932,8 @@ cmd_failover() {
   echo ""
 
   step "2. Current replication lag (should be 0 before outage):"
-  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-topic 2>&1 | \
-    grep -E "^Name:|LAG" | head -20
+  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
+    grep -E "^Name:|PARTITION|SRC_LSO" | head -20
   echo ""
 
   step "3. Producing 10 messages to eu-west-1 before outage..."
@@ -946,8 +960,8 @@ cmd_failover() {
   echo ""
 
   step "5. Final replication lag (this is our RPO — data synced before outage):"
-  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-topic 2>&1 | \
-    grep -E "^Name:|PARTITION|LAG" | head -30
+  rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
+    grep -E "^Name:|PARTITION|SRC_LSO" | head -30
   echo ""
 
   step "6. Initiating failover — converting shadow topics to writable..."
