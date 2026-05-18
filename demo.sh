@@ -28,7 +28,6 @@ usage() {
   echo "  preflight              Pre-meeting health check — verify all pods, links, and URLs"
   echo ""
   echo "  produce [n]            Produce n order events to eu-west-1 (default: 10)"
-  echo "  produce-large          Produce a 10MB message — demonstrate large payload support"
   echo "  consume-source         Consume retail-orders from eu-west-1"
   echo "  consume-shadow         Consume retail-orders from eu-central-1"
   echo "  consume-both           Both clusters side by side"
@@ -188,52 +187,6 @@ cmd_preflight() {
   fi
 }
 
-cmd_produce_large() {
-  banner "Large Payload Support — 10MB Message"
-  step "Cluster : $CONTEXT_A (eu-west-1)"
-  step "Topic   : $TOPIC"
-  info "Demonstrating large payload support — up to 10MB messages handled natively."
-  echo ""
-
-  # ── 1. Bump cluster max message size ──────────────────────────────────────
-  step "1. Configuring cluster to accept large messages (kafka_batch_max_bytes = 11MB)..."
-  rp_exec "$CONTEXT_A" rpk cluster config set kafka_batch_max_bytes 11534336 2>&1
-  ok "Cluster max message size set to 11MB"
-  info "  (config change takes effect immediately — no restart required)"
-  echo ""
-
-  # ── 2. Generate payload ───────────────────────────────────────────────────
-  step "2. Generating a ~10MB payload..."
-  local tmpfile
-  tmpfile=$(mktemp)
-  # Build ~10MB JSON: base64-encoded random block + metadata
-  # Use bash string slice to truncate (avoids SIGPIPE from head -c in pipeline)
-  local pad
-  pad=$(dd if=/dev/urandom bs=7500000 count=1 2>/dev/null | base64 | tr -d '\n')
-  pad="${pad:0:9900000}"
-  local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  # rpk produce reads newline-delimited records — trailing \n is required
-  printf '{"type":"large-payload-test","size_bytes":10000000,"ts":"%s","data":"%s"}\n' \
-    "$ts" "$pad" > "$tmpfile"
-  local actual_size; actual_size=$(wc -c < "$tmpfile" | tr -d ' ')
-  info "  Payload size: $actual_size bytes (~$(( actual_size / 1024 / 1024 ))MB)"
-  echo ""
-
-  # ── 3. Produce ────────────────────────────────────────────────────────────
-  step "3. Producing to $TOPIC..."
-  kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
-    rpk topic produce "$TOPIC" --key "large-payload" \
-    --max-message-bytes 11534336 < "$tmpfile" 2>&1
-  rm -f "$tmpfile"
-  echo ""
-
-  # ── 4. Confirm ────────────────────────────────────────────────────────────
-  step "4. Confirming message was written (high-watermark increment):"
-  rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>&1
-  echo ""
-  ok "10MB payload produced and confirmed."
-  info "Redpanda supports configurable max message sizes — no special broker deployment needed."
-}
 
 cmd_produce() {
   local n=${1:-10}
@@ -1035,7 +988,6 @@ cmd_restore() {
 case "${1:-}" in
   preflight)      cmd_preflight ;;
   produce)        cmd_produce "${2:-10}" ;;
-  produce-large)  cmd_produce_large ;;
   consume-source) cmd_consume_source ;;
   consume-shadow) cmd_consume_shadow ;;
   consume-both)   cmd_consume_both ;;
