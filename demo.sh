@@ -49,13 +49,15 @@ except:
 grafana_annotate() {
   local ctx="$1" text="$2" tag="${3:-demo}"
   local grafana_svc="kube-prometheus-stack-grafana"
-  local grafana_host
+  local grafana_host grafana_pass
   grafana_host=$(kubectl --context "$ctx" -n monitoring get svc "$grafana_svc" \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
   [[ -z "$grafana_host" ]] && return 0
+  grafana_pass=$(kubectl --context "$ctx" -n monitoring get secret "$grafana_svc" \
+    -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
   curl -sf -X POST \
     -H "Content-Type: application/json" \
-    -u "admin:prom-operator" \
+    -u "admin:${grafana_pass}" \
     "http://${grafana_host}/api/annotations" \
     -d "{\"text\":\"${text}\",\"tags\":[\"${tag}\",\"redpanda-demo\"]}" \
     &>/dev/null || true
@@ -202,14 +204,18 @@ cmd_preflight() {
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   GRAFANA_B=$(kubectl --context "$CONTEXT_B" -n monitoring get svc kube-prometheus-stack-grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  GRAFANA_PASS_A=$(kubectl --context "$CONTEXT_A" -n monitoring get secret kube-prometheus-stack-grafana \
+    -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
+  GRAFANA_PASS_B=$(kubectl --context "$CONTEXT_B" -n monitoring get secret kube-prometheus-stack-grafana \
+    -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
 
   [[ -n "$CONSOLE_A" ]] && info "  Console eu-west-1   : http://$CONSOLE_A:8080" \
     || echo -e "  ${RED}Console eu-west-1   : LoadBalancer not ready${NC}"
   [[ -n "$CONSOLE_B" ]] && info "  Console eu-central-1: http://$CONSOLE_B:8080" \
     || echo -e "  ${RED}Console eu-central-1: LoadBalancer not ready${NC}"
-  [[ -n "$GRAFANA_A" ]] && info "  Grafana eu-west-1   : http://$GRAFANA_A  (admin / prom-operator)" \
+  [[ -n "$GRAFANA_A" ]] && info "  Grafana eu-west-1   : http://$GRAFANA_A  (admin / ${GRAFANA_PASS_A})" \
     || echo -e "  ${RED}Grafana eu-west-1   : LoadBalancer not ready${NC}"
-  [[ -n "$GRAFANA_B" ]] && info "  Grafana eu-central-1: http://$GRAFANA_B  (admin / prom-operator)" \
+  [[ -n "$GRAFANA_B" ]] && info "  Grafana eu-central-1: http://$GRAFANA_B  (admin / ${GRAFANA_PASS_B})" \
     || echo -e "  ${RED}Grafana eu-central-1: LoadBalancer not ready${NC}"
   echo ""
 
@@ -897,7 +903,7 @@ cmd_chaos() {
   while true; do
     ELAPSED=$(( SECONDS - CHAOS_START ))
     HEALTH=$(rp_exec "$CONTEXT_A" rpk cluster health 2>/dev/null | \
-      awk '/^Healthy:/{print $2}' || echo "false")
+      awk '/^Healthy:/{print $2; exit}' || echo "false")
     POD_PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod redpanda-0 \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
     UNAVAIL=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
