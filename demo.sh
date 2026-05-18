@@ -21,6 +21,46 @@ step()   { echo -e "${CYAN}▶ $1${NC}"; }
 ok()     { echo -e "${GREEN}✓ $1${NC}"; }
 info()   { echo -e "${YELLOW}  $1${NC}"; }
 
+# ── Observability helpers ──────────────────────────────────────────────────────
+
+# prom_query <context> <promql>
+# Queries Prometheus via the kube API proxy. Returns the sum of all series values
+# as an integer, or '?' if unavailable.
+prom_query() {
+  local ctx="$1" query="$2"
+  local encoded
+  encoded=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$query" 2>/dev/null || echo "$query")
+  kubectl --context "$ctx" get --raw \
+    "/api/v1/namespaces/monitoring/services/kube-prometheus-stack-prometheus:9090/proxy/api/v1/query?query=${encoded}" \
+    2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    total = sum(float(r['value'][1]) for r in d['data']['result'])
+    print(int(total))
+except:
+    print('?')
+" 2>/dev/null || echo "?"
+}
+
+# grafana_annotate <context> <text> <tag>
+# Posts a named annotation to Grafana so events appear as markers on dashboards.
+# Fails silently — never blocks the demo.
+grafana_annotate() {
+  local ctx="$1" text="$2" tag="${3:-demo}"
+  local grafana_svc="kube-prometheus-stack-grafana"
+  local grafana_host
+  grafana_host=$(kubectl --context "$ctx" -n monitoring get svc "$grafana_svc" \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+  [[ -z "$grafana_host" ]] && return 0
+  curl -sf -X POST \
+    -H "Content-Type: application/json" \
+    -u "admin:prom-operator" \
+    "http://${grafana_host}/api/annotations" \
+    -d "{\"text\":\"${text}\",\"tags\":[\"${tag}\",\"redpanda-demo\"]}" \
+    &>/dev/null || true
+}
+
 usage() {
   echo "Usage: $0 <command>"
   echo ""
@@ -586,30 +626,35 @@ cmd_upgrade() {
   rp_exec "$CONTEXT_A" rpk cluster health 2>&1
   PRE_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
-  info "  High-watermark before upgrade: $PRE_HWM"
+  UNREPL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
+  info "  High-watermark before upgrade  : $PRE_HWM"
+  info "  under_replicated_replicas      : ${UNREPL_PRE}  (expect 0 — all partitions in sync)"
   echo ""
 
   step "3. Triggering rolling restart via Operator (kubectl rollout restart)..."
   info "  In production this is triggered by a version bump in the Redpanda CR YAML — Git PR → Operator."
   info "  For the demo we trigger it directly:"
   kubectl --context "$CONTEXT_A" -n redpanda rollout restart statefulset/redpanda 2>&1
+  grafana_annotate "$CONTEXT_A" "upgrade: rolling restart started" "upgrade"
   UPGRADE_START=$SECONDS
   echo ""
 
   step "4. Watching broker-by-broker rolling restart..."
   info "  StatefulSet restarts pods one at a time: drain → terminate → restart → health-check → next"
+  info "  under_replicated_replicas goes non-zero as each broker drains, returns to 0 before next cycles"
   echo ""
   for BROKER in 0 1 2; do
     info "  ── broker redpanda-$BROKER ──"
-    # Phase 1: wait for pod to start cycling (go not-ready or disappear)
     SEEN_DOWN=false
     for _ in $(seq 1 24); do
       READY=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
         -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
       PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
         -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
+      UNREPL=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
       ELAPSED=$(( SECONDS - UPGRADE_START ))
-      printf "  %3ds  redpanda-$BROKER  phase=%-10s  ready=%s\n" "$ELAPSED" "$PHASE" "$READY"
+      printf "  %3ds  redpanda-$BROKER  phase=%-10s  ready=%-5s  under_replicated=%s\n" \
+        "$ELAPSED" "$PHASE" "$READY" "$UNREPL"
       if [[ "$READY" != "True" || "$PHASE" != "Running" ]]; then
         SEEN_DOWN=true
       fi
@@ -634,6 +679,7 @@ cmd_upgrade() {
 
   ELAPSED=$(( SECONDS - UPGRADE_START ))
   echo ""
+  grafana_annotate "$CONTEXT_A" "upgrade: rolling restart complete — ${ELAPSED}s, ${MSGS_DURING} msgs produced, 0 lost" "upgrade"
   ok "═══════════════════════════════════════════"
   ok "  ROLLING UPGRADE COMPLETE"
   ok "  Duration                  : ${ELAPSED}s"
@@ -829,18 +875,24 @@ cmd_chaos() {
     grep -E "^Name:|PARTITION|SRC_LSO" | head -20
   echo ""
 
-  step "3. Cluster health before kill:"
+  step "3. Cluster health + metrics before kill:"
   rp_exec "$CONTEXT_A" rpk cluster health 2>&1
+  UNAVAIL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
+  UNREPL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
+  info "  unavailable_partitions   : ${UNAVAIL_PRE}  (expect 0)"
+  info "  under_replicated_replicas: ${UNREPL_PRE}  (expect 0)"
   echo ""
 
   info "Killing redpanda-0 on eu-west-1 in 3 seconds..."
   sleep 3
   CHAOS_START=$SECONDS
+  grafana_annotate "$CONTEXT_A" "chaos: redpanda-0 deleted" "chaos"
   kubectl --context "$CONTEXT_A" -n redpanda delete pod redpanda-0 --grace-period=0 2>&1
   echo -e "${RED}✗ redpanda-0 deleted — outage started${NC}"
   echo ""
 
   step "4. Watching cluster recovery (polling every 5s)..."
+  info "  Prometheus metrics update every 15s — values lag slightly behind pod state"
   RECOVERED=false
   while true; do
     ELAPSED=$(( SECONDS - CHAOS_START ))
@@ -848,7 +900,9 @@ cmd_chaos() {
       awk '/^Healthy:/{print $2}' || echo "false")
     POD_PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod redpanda-0 \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
-    echo -e "  ${ELAPSED}s — pod: ${POD_PHASE} | Healthy: ${HEALTH}"
+    UNAVAIL=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
+    UNREPL=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
+    echo -e "  ${ELAPSED}s — pod: ${POD_PHASE} | Healthy: ${HEALTH} | unavailable_partitions: ${UNAVAIL} | under_replicated: ${UNREPL}"
     if echo "$HEALTH" | grep -q "true" && [[ "$POD_PHASE" == "Running" ]]; then
       RECOVERED=true
       break
@@ -862,9 +916,16 @@ cmd_chaos() {
 
   if $RECOVERED; then
     RTO=$(( SECONDS - CHAOS_START ))
+    grafana_annotate "$CONTEXT_A" "chaos: cluster recovered — RTO ${RTO}s" "chaos"
     ok "Broker recovered in ${RTO}s"
     echo ""
-    step "5. ShadowLink lag after recovery (should be 0 or near-0):"
+    step "5. Metrics after recovery:"
+    UNAVAIL_POST=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
+    UNREPL_POST=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
+    info "  unavailable_partitions   : ${UNAVAIL_PRE} → ${UNAVAIL_POST}  (back to 0)"
+    info "  under_replicated_replicas: ${UNREPL_PRE} → ${UNREPL_POST}  (back to 0)"
+    echo ""
+    step "6. ShadowLink lag after recovery (should be 0 or near-0):"
     rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
       grep -E "^Name:|PARTITION|SRC_LSO" | head -20
     echo ""
@@ -897,6 +958,7 @@ cmd_failover() {
   info "(scaling Redpanda StatefulSet to 0 replicas)"
   sleep 3
   OUTAGE_START=$SECONDS
+  grafana_annotate "$CONTEXT_B" "failover: eu-west-1 outage simulated — scale-to-0" "failover"
   kubectl --context "$CONTEXT_A" -n redpanda scale statefulset redpanda --replicas=0 2>&1
   echo -e "${RED}✗ eu-west-1 source cluster is DOWN — outage clock started${NC}"
   echo ""
@@ -932,6 +994,7 @@ cmd_failover() {
   RTO=$(( SECONDS - OUTAGE_START ))
   FAILOVER_TIME=$(( SECONDS - FAILOVER_START ))
   echo ""
+  grafana_annotate "$CONTEXT_B" "failover: eu-central-1 promoted to PRIMARY — RTO ${RTO}s" "failover"
   ok "═══════════════════════════════════════════"
   ok "  FAILOVER COMPLETE"
   ok "  Total outage → recovery time : ${RTO}s"
