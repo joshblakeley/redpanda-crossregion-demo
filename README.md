@@ -1,30 +1,352 @@
 # Redpanda Cross-Region Demo
+## IKEA (Ingka Group) — Event Messaging Platform Evaluation
 
-A self-contained demo environment showing Redpanda's enterprise event streaming capabilities across two AWS EKS clusters. Demonstrates Kubernetes-native deployment, cross-region replication with ShadowLink, MQTT protocol bridging, and live DR failover with measurable RTO/RPO.
+**Demo**: Wed 20 May 2026, 10:00 AM BST  
+**Format**: 90 minutes, 9 segments — Jeff owns bookends, Josh owns technical segments  
+**Evaluators**: Nihar Shah (Eng Leader, decision-maker), Martin Hilferink (Sr Tech Architect), Subhasish Bhabani (Solace Operator), Björn Ramberg (Exec Sponsor)
+
+> This is not a Solace replacement demo. It's "build the event infrastructure that will run IKEA's AI agent estate for the next five years." Surface this at the close.
+
+---
 
 ## Architecture
 
 ```
-eu-west-1 (primary)                              eu-central-1 (DR)
-┌──────────────────────────────────┐             ┌──────────────────────────────────┐
-│  Mosquitto MQTT broker           │             │                                  │
-│      │                           │             │  Redpanda Connect                │
-│  Redpanda Connect                │             │  (Kafka → AMQP 0.9.1 bridge)     │
-│  (MQTT → Kafka bridge)           │             │      │                           │
-│      │                           │             │  RabbitMQ                        │
-│  Redpanda 3-node cluster         │──ShadowLink▶│  Redpanda 3-node cluster         │
-│  retail-orders, iot-events       │             │  (shadow topics, read-only)      │
-│      │                           │             │      │                           │
-│  Python confluent-kafka consumer │             │  Python pika AMQP consumer       │
-│  Redpanda Console                │             │  Redpanda Console                │
-│  Prometheus + Grafana            │             │  Prometheus + Grafana            │
-└──────────────────────────────────┘             └──────────────────────────────────┘
+eu-west-1 (primary / "EU cluster")                eu-central-1 (DR / "shadow cluster")
+┌──────────────────────────────────┐              ┌──────────────────────────────────┐
+│  Mosquitto MQTT broker           │              │                                  │
+│      │                           │              │  Redpanda Connect                │
+│  Redpanda Connect                │              │  (Kafka → AMQP 0.9.1 bridge)     │
+│  (MQTT → Kafka bridge)           │              │      │                           │
+│      │                           │              │  RabbitMQ                        │
+│  Redpanda 3-node cluster         │──ShadowLink─▶│  Redpanda 3-node cluster         │
+│  retail-orders, iot-events       │  (eu- topics │  (shadow topics, read-only)      │
+│  eu-*, cn-* topics               │   replicate, │      │                           │
+│                                  │   cn-* don't)│  Python pika AMQP consumer       │
+│  Python confluent-kafka consumer │              │  Redpanda Console                │
+│  Redpanda Console                │              │  Prometheus + Grafana            │
+│  Prometheus + Grafana            │              └──────────────────────────────────┘
+└──────────────────────────────────┘
+
+ShadowLink filter policy (clusters/region-b/shadowlink.yaml):
+  cn-* prefix → EXCLUDED (China data stays local — Cyber Law)
+  everything else → INCLUDED (replicates to DR cluster)
 ```
 
-**EKS clusters**: `rp-demo-eu-west-1`, `rp-demo-eu-central-1`  
+**EKS clusters**: `rp-demo-eu-west-1` (primary), `rp-demo-eu-central-1` (DR)  
 **Instance type**: m7gd.large (Graviton3, local NVMe via LVM CSI)  
-**Redpanda Operator**: v26.1.3  
-**Topics**: `retail-orders` (order events), `iot-events` (MQTT bridge output)
+**Redpanda Operator**: v26.1.3
+
+---
+
+## Before the Meeting (10–15 min)
+
+```bash
+./demo.sh preflight
+```
+
+Checks every pod, ShadowLink state, both topics, and prints Console + Grafana URLs. Fix anything red.
+
+**Open these browser tabs before you start:**
+- Console eu-west-1 (`:8080`) — topic list, message viewer, audit log
+- Console eu-central-1 (`:8080`) — shadow topic confirmation
+- Grafana eu-west-1 — Redpanda Overview dashboard (keep visible during chaos + DR)
+
+**⚠ Say this proactively in Segment 0:** *"Our demo runs on AWS EKS — the operator and broker are cloud-agnostic, identical on GCP GKE, Azure AKS, on-prem Kubernetes, and AliCloud ACK. Ingka's environment is all four of those."* Don't wait to be asked.
+
+---
+
+## Demo Flow — 90 Minutes
+
+### Segment 0 — Context Setting (5 min) | Jeff
+
+Jeff opens. Two jobs for this segment:
+
+**1. Acknowledge the 2023 evaluation generically — don't name Bruno:**
+> *"We know your team looked at Redpanda before — here's what has changed."*  
+Three things on one slide: Schema Registry built-in (GA 2023), Tiered Storage GA, Operator-driven scale-down automated.
+
+**2. State cloud-agnosticism immediately:**
+> *"Our demo runs on AWS EKS. The operator and broker are identical on GCP GKE, Azure AKS, on-prem Kubernetes, and AliCloud ACK — same YAML, same GitOps model, same day-2 behaviour."*
+
+**Josh picks up with:**
+> *"Most vendors will show you a Solace replacement today. We want to show you something different — the streaming backbone for your AI Agent gateways, your data mesh, your inference pipelines, and your compliance logging. The Solace migration is the entry point. The AI infrastructure is where this platform goes."*
+
+---
+
+### Segment 1 — Current → Future Architecture Recap (5–7 min) | Jeff
+
+Single slide showing what Redpanda understands about the current Solace estate and target state.
+
+**Cover explicitly:**
+- What's being replaced: Solace event mesh (Sweden on-prem, GCP, AliCloud, Azure, AWS) + Kong+Solace Partner Portal + SMF protocol translation
+- Target state: self-hosted K8s-native, AliCloud included, 10K msg/sec, 500–1,000 consumers across 50+ markets, 80–95% tiered storage offload
+- Three things that matter most: zero message loss on failover for SL1 platforms, minimal ops overhead, migration path with no day-one Solace refactoring
+
+**Invite correction:** *"Before Josh opens a terminal, does this match your topology? Correct us now."*
+
+> **Why this matters:** Shows Subhasish exactly what happens to his existing producers (bridge path, no day-one refactoring). Shows Martin that the Kong+Solace translation layer disappears entirely.
+
+---
+
+### Segment 2 — Reference Customer (3–4 min) | Jeff
+
+Large global enterprise, self-hosted BYOC, multi-region, migration from legacy messaging, or regulated data residency. Retail or IoT-heavy reference preferred. Objective: prove Redpanda has done this migration before, not just greenfield deployments.
+
+---
+
+### Segment 3 — Kubernetes-Native Platform & GitOps (8 min) | Josh
+
+**Assessment: STRONG. Frame for Nihar (25% cost reduction) and Björn (governance).**
+
+```bash
+# Start a live producer in the background first, then trigger the rolling restart
+./demo.sh upgrade
+```
+
+Narrate as it runs:
+> *"Your platform team writes YAML. The operator provisions, upgrades, and scales the cluster. No manual broker operations. The full environment is reproducible from a Git repo — every change is a PR, every state is auditable."*
+
+Watch the counter — messages produced during the rolling restart, messages lost = 0.
+
+**Browser:** Point to Grafana — under-replicated partitions briefly non-zero per broker, returns to 0 as each one rejoins. No producer interruption.
+
+**Key hits:**
+- **Nihar:** "This is how you get from 'reducing operational costs' to 25% — the operator handles every upgrade, every patch, every scale event."
+- **Björn:** "Governance and enablement for the entire Ingka developer community — every infrastructure change is a PR."
+
+**ADP connection:** *"This is also how AI agent infrastructure gets deployed and managed at scale — same operator model runs your streaming platform and your AI event infrastructure."*
+
+---
+
+### Segment 4 — Cross-Region Replication / ShadowLink (8 min) | Josh
+
+**Assessment: STRONG. Land offset-sync and schema registry sync explicitly — Nihar's most critical requirement.**
+
+```bash
+./demo.sh produce 20       # produce to eu-west-1
+./demo.sh consume-both     # watch both clusters receive messages
+./demo.sh status           # show consumer group offsets synced cross-region
+```
+
+State explicitly:
+> *"When the primary region fails, consumers switch to the DR cluster and resume from exactly the last message they processed. No replay. No data loss. No reconfiguration."*
+
+**Explicitly call out schema registry sync** — Ingka has an existing schema registry and a migration path concern. Point to the `schemaRegistrySyncOptions` in shadowlink.yaml:
+```bash
+kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shadow -o yaml | grep -A5 schemaRegistry
+```
+
+**Browser:** Show Grafana — throughput dropping on primary, coming up on DR.
+
+**Key hits:**
+- **Nihar:** "SL1 for 50+ markets — schema registry sync means your consumer contracts stay intact across a regional failure."
+- **Schema registry:** Redpanda built-in SR is Confluent SR API-compatible — existing SR tooling works.
+
+**ADP connection:** *"The same replication that protects your operational event flows also replicates agent context, inference logs, and model event streams across regions — without loss, without replay."*
+
+---
+
+### Segment 5 — Protocol Bridging + Solace Migration Architecture (12 min) | Josh
+
+**Assessment: NEEDS PROACTIVE FRAMING. Own the RabbitMQ before anyone asks. Add Solace migration path.**
+
+```bash
+# Terminal 1: watch the end of the chain
+./demo.sh amqp-consume
+
+# Terminal 2: publish MQTT events
+./demo.sh mqtt-publish 10
+```
+
+**Own the RabbitMQ immediately:**
+> *"We're using RabbitMQ here as an AMQP endpoint to illustrate the pattern — in your environment this is any AMQP consumer. Redpanda Connect handles protocol translation at the edge; the broker stays pure Kafka API throughout."*
+
+**For Subhasish — walk the Solace migration path explicitly:**
+> *"Connect has a Solace SMF source connector. Your existing producers stay on Solace. Events bridge into Redpanda. Consumers migrate at their own pace. Week one looks like this: nothing changes for your 250+ SMF-connected endpoints. They keep publishing to Solace. Connect reads from Solace and writes to Redpanda. Migration is topic-by-topic, team-by-team."*
+
+**Tie to MQTT/IKEA reality:**
+- 250+ warehouse drones at 73 locations → MQTT → Redpanda Connect → `iot-events` topic
+- This is directly how IKEA's IoT estate works today
+
+```bash
+./demo.sh amqp-status     # show pipeline health, consumer group lag
+```
+
+**ADP connection:** *"The same Connect pipeline that ingests MQTT telemetry from your 250 warehouse drones is also how sensor data feeds AI pipelines in real time — computer vision, inventory models, drone autonomy. You're not building two pipelines. You're building one."*
+
+---
+
+### Segment 6 — Policy-Based Routing & Data Residency (6 min) | Josh
+
+**Assessment: WEAKEST SEGMENT. Reframe as GitOps governance and EU AI Act infrastructure. Don't show it as a two-line filter — show it as the architecture of compliance.**
+
+```bash
+./demo.sh routing
+```
+
+**Lead with the reframe for Martin** (who built the Solace mesh and knows what Solace's routing UI looks like):
+> *"Routing policy is code. It lives in your GitOps repository — every change is a pull request with a reviewer and a complete audit trail. That's a stronger governance model than a UI where a routing rule can be changed with a click and no record."*
+
+Watch the countdown. After the result:
+- `eu-transaction-events` → replicated to DR cluster ✓
+- `cn-inventory-data` → local only ✓ (Cyber Law enforced at infrastructure layer)
+
+**Name Cyber Law compliance explicitly.** Chinese data didn't leave eu-west-1. That's not a naming convention — it's enforced by the broker before any data leaves the network.
+
+**Browser:** Show Console → Audit Log. Every ShadowLink filter change, every ACL update, every topic creation is logged. This is the governance trail.
+
+**Key hits:**
+- **Martin:** Policy-as-code resonates with his MCP/AI gateway direction — same model as his API gateway governance
+- **Nihar:** Governance is part of SL1 platform requirements
+
+**ADP connection:** *"Data residency enforcement at the broker layer is also how you satisfy the EU AI Act's requirement that model training data and inference inputs are processed only in permitted jurisdictions — enforced at the infrastructure layer, not the application layer."*
+
+---
+
+### Segment 7 — High Availability + Multi-Tenancy (5 min) | Josh
+
+**Assessment: STRONG. Kill the broker AND show blast radius after — Section 5.3 of demo requirements asks for multi-tenancy explicitly.**
+
+```bash
+# Kill broker-0, read the RTO out loud
+./demo.sh chaos
+```
+
+After the RTO prints, add immediately:
+> *"The failure of this broker affected only the partitions it was leading — other tenants on the platform kept processing without interruption."*
+
+Then pivot straight to multi-tenancy:
+```bash
+./demo.sh quotas
+```
+
+This shows namespaces, ACLs, per-client throughput quotas, and rate limiting. Walk through:
+1. `demo-tenant-a` service account
+2. ACL: can only access `tenant-a-events` — no access to other teams' topics
+3. Throughput quota: 5 MB/s produce, 10 MB/s consume — one team's surge can't starve others
+
+**Key hit for Nihar:** Blast radius containment is a day-1 operational requirement for a 50+ market platform. This is not theoretical.
+
+---
+
+### Segment 8 — Disaster Recovery (10 min) | Josh
+
+**Assessment: STRONG. Add Grafana visibility. Close the 2023 'infinite retention' objection.**
+
+```bash
+# Walk through restore flow BEFORE triggering — show the recovery path
+./demo.sh failover
+```
+
+**Before triggering failover:**
+> *"Let me show you what the restore path looks like before I pull the trigger — so you can see the full operational picture."*
+Point to `./demo.sh restore` in the README.
+
+**During failover:**
+- **Browser (Grafana):** throughput dropping on eu-west-1, coming up on eu-central-1 — show the transition
+- **Browser (Console):** point to `retail-orders` on eu-central-1 going from read-only shadow to writable
+
+**Close the 2023 'infinite retention' objection** (without naming Bruno):
+> *"One concern from a previous evaluation was that Redpanda was disk-bound. Tiered Storage offloads 80–95% of data to object storage — S3, GCS, AliOSS. Consumers read historical data transparently — no difference between a message from yesterday and a message from six months ago."*
+
+**Show 10MB payload support (if not shown earlier):**
+```bash
+./demo.sh produce-large
+```
+> *"Your RFI states some publishers up to 10MB. Handled."*
+
+**Key hits:**
+- **Subhasish:** Ops console view of the failover — this is his day job
+- **Everyone:** Seamless historical read from tiered storage = infinite retention objection closed
+
+---
+
+### Segment 9 — Iceberg + ADP Close (5 min) | Jeff
+
+Jeff closes with the forward-looking platform investment story:
+
+> *"You came here evaluating a Solace replacement. What you're actually selecting is the streaming backbone for the next five years of your data and AI architecture."*
+
+Three points:
+- **Iceberg-compatible tiered storage:** 80–95% offloaded to object storage is queryable directly from Databricks, Snowflake — no pulling through the broker. Martin has Databricks in the stack already.
+- **EU AI Act audit trail:** Redpanda's immutable append-only log is architecturally aligned with AI Act inference logging requirements.
+- **Agentic Data Plane:** Martin is building MCP servers and AI Agent gateways right now. The event infrastructure those agents need — real-time context delivery, agent-to-agent communication, tool call event streams — is exactly what Redpanda was built for.
+
+Close line: *"The Solace migration funds the AI infrastructure. Same cluster, same data, same guarantees."*
+
+Then Jeff asks: *"Can we schedule a follow-up architecture session with your full platform team before the RFP document drops?"*
+
+---
+
+## Key Landmines to Pre-empt
+
+| Landmine | Who Raises It | Pre-emption |
+|---|---|---|
+| Demo runs on AWS, we're on GCP/Azure/AliCloud | Martin or Subhasish | State in Segment 0: operator is cloud-agnostic, identical on GCP GKE, Azure AKS, on-prem K8s, AliCloud ACK |
+| Why is there a RabbitMQ? | Subhasish | Own it in Segment 5 before they ask — frame as edge translation pattern, not a dependency |
+| Policy routing looks thin vs Solace mesh UI | Martin (built the Solace mesh) | GitOps reframe: policy is code, lives in Git, every change is a PR. Stronger governance than a UI |
+| Migration path for 250+ Solace endpoints | Subhasish | Connect Solace SMF source connector = no day-one refactoring. Migration is incremental, topic-by-topic |
+| Can you really run on AliCloud? | Any evaluator | Immediate, confident: self-hosted on AliCloud ACK, same operator, same GitOps model |
+| Vendor stability — 5-year platform bet | Björn (5 months in role) | Funding, ARR trajectory, customer logos, independence from IBM/Confluent |
+| Demo shows 2 regions, we have 5+ across 4 clouds | Any evaluator | ShadowLink scales to N clusters. Routing policy is additive YAML. Show the pattern — scale follows |
+| Schema registry compatibility | Subhasish | Built-in SR GA since 2023. Full Confluent SR API compatibility. External SR also supported |
+
+**Do NOT name Bruno Gouveia.** He ran the 2023 evaluation and knows Redpanda's historical gaps. Address his objections (scale-down, infinite retention, schema registry) proactively in the demo flow without referencing him.
+
+---
+
+## 2023 Objections — Close Them Proactively
+
+| 2023 Concern | Answer |
+|---|---|
+| Record deletion | Compacted topics + tombstone records. Key-based delete via null-value record. GDPR-compliant pattern. |
+| Scale-down was painful | Operator: automated decommission with partition rebalance. Tiered storage reduces data volume moved during scale-down. |
+| Needed external Confluent SR | Built-in Schema Registry, GA since 2023. Full Confluent SR API compatibility. |
+| Disk-bound, no infinite retention | Tiered Storage to S3/GCS/AliOSS. Consumer reads historical data transparently — no difference from hot data. |
+
+---
+
+## All Commands
+
+| Command | Segment | Description |
+|---|---|---|
+| `preflight` | Before | Health check — verify all pods, ShadowLink, URLs |
+| `upgrade` | 3 | Rolling cluster upgrade with live producer — zero message loss |
+| `produce [n]` | 4 | Produce n order events to eu-west-1 (default: 10) |
+| `produce-large` | 8 | Produce a 10MB message — demonstrate large payload support |
+| `consume-source` | 4 | Consume `retail-orders` from eu-west-1 |
+| `consume-shadow` | 4 | Consume `retail-orders` from eu-central-1 |
+| `consume-both` | 4 | Both clusters side by side |
+| `status` | 4 | ShadowLink status, topic offsets, consumer group sync |
+| `mqtt-publish [n]` | 5 | Publish n MQTT events via Mosquitto (default: 10) |
+| `mqtt-consume [source\|shadow]` | 5 | Consume `iot-events` as a Kafka client |
+| `mqtt-status` | 5 | MQTT bridge pipeline status |
+| `amqp-consume` | 5 | AMQP 0.9.1 consumer — end of MQTT→Kafka→AMQP chain |
+| `amqp-status` | 5 | RabbitMQ + AMQP bridge pipeline status |
+| `routing` | 6 | Data residency: `cn-` topics stay local, `eu-` topics replicate |
+| `chaos` | 7 | Kill broker-0, read RTO out loud |
+| `quotas` | 7 | Multi-tenancy: ACLs, per-client quotas, blast radius |
+| `failover` | 8 | Promote eu-central-1 to primary (**irreversible**) |
+| `restore` | 8 | Scale eu-west-1 back up, recreate ShadowLink |
+| `python-consume [source\|shadow]` | — | Python confluent-kafka consumer (retail-orders) |
+| `full-demo` | — | Fully scripted end-to-end demo |
+
+---
+
+## Recovery Playbook
+
+| Symptom | Fix |
+|---|---|
+| ShadowLink not active | `kubectl --context rp-demo-eu-central-1 -n redpanda describe shadowlink eu-west-1-shadow` — check Events |
+| AMQP consumer not receiving | `kubectl --context rp-demo-eu-central-1 -n redpanda rollout restart deployment/connect-amqp-bridge` |
+| MQTT bridge not consuming | `kubectl --context rp-demo-eu-west-1 -n redpanda rollout restart deployment/connect-mqtt-bridge` — wait 30s for client ID re-registration |
+| Shadow topics missing on eu-central-1 | Wait 30s — ShadowLink interval is 30s. Check `./demo.sh status` |
+| `chaos` — cluster doesn't recover | `kubectl --context rp-demo-eu-west-1 -n redpanda describe pod redpanda-0` — look for PVC or node issues |
+| `upgrade` — annotation doesn't trigger restart | `kubectl --context rp-demo-eu-west-1 -n redpanda rollout restart statefulset/redpanda` as fallback |
+| `quotas` — rpk quotas command fails | Quotas command syntax varies by version. Show ACLs and explain the quota model verbally |
+| Demo needs reset after failover | `./demo.sh restore` — safe to run multiple times |
+| cn- topic appears on eu-central-1 | ShadowLink filter change needs re-apply: `kubectl --context rp-demo-eu-central-1 apply -f clusters/region-b/shadowlink.yaml` |
 
 ---
 
@@ -35,238 +357,23 @@ cd demo/
 ./setup.sh
 ```
 
-Provisions both EKS clusters, installs cert-manager + LVM CSI + kube-prometheus-stack, deploys the Redpanda Operator and 3-node clusters, enables ShadowLink, deploys all bridge services, and creates topics. Takes ~25–35 minutes.
+Provisions both EKS clusters, installs cert-manager + LVM CSI + kube-prometheus-stack, deploys Redpanda Operator, 3-node clusters, ShadowLink, MQTT bridge, AMQP bridge, and creates topics. Takes ~25–35 minutes.
 
-### Prerequisites
-
-- `eksctl`, `kubectl`, `helm` installed and configured
-- AWS credentials with EKS create permissions in eu-west-1 and eu-central-1
-
----
-
-## Running the Demo — Presenter Runsheet
-
-### Before the meeting (10–15 min)
-
-Run the pre-flight check:
-
+**After setup, apply the updated ShadowLink filter (cn- prefix):**
 ```bash
-./demo.sh preflight
-```
+# The filter was updated from 'regional-' to 'cn-' to match the data residency demo
+BROKER_0=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-0 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+BROKER_1=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-1 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+BROKER_2=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-2 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
-This verifies every pod, the ShadowLink state, both topics, and prints Console + Grafana URLs. Fix anything red before starting.
-
-**Open these tabs in your browser ahead of time:**
-- Redpanda Console eu-west-1 (port 8080) — topic list + message viewer
-- Redpanda Console eu-central-1 (port 8080) — shadow topic confirmation
-- Grafana eu-west-1 — Redpanda dashboard, keep it visible during chaos demo
-
----
-
-### Segment 1 — Cross-Region Replication (~5 min)
-
-**What you're showing:** Write once in eu-west-1, read from anywhere. ShadowLink keeps eu-central-1 in sync with zero application-side effort.
-
-**Terminal:**
-```bash
-# Show current replication state and topic offsets
-./demo.sh status
-```
-> Point to "ShadowLink is active" and the matching high-watermarks between both clusters.
-
-```bash
-# Produce 20 order events
-./demo.sh produce 20
-```
-> Walk through the JSON payload — order_id, store, amount, timestamp. These are retail point-of-sale events.
-
-```bash
-# Watch messages arrive on both clusters simultaneously
-./demo.sh consume-both
-```
-> Both consumers start printing. eu-central-1 lags slightly — that's the 30-second sync interval. Ctrl+C after you've made the point.
-
-**Browser:** Switch to Console eu-central-1, navigate to the `retail-orders` topic, show messages are there. Click a message to show the full payload.
-
-**Key point:** Consumer group offsets sync too. If eu-central-1 took over as primary right now, consumers would resume from where they left off — no replay, no gap.
-
----
-
-### Segment 2 — Protocol Bridging (MQTT → Kafka → AMQP) (~7 min)
-
-**What you're showing:** Redpanda as a universal integration hub. IoT devices speak MQTT; backend systems speak AMQP; everything flows through the same Kafka-protocol cluster.
-
-**Terminal — window 1:**
-```bash
-# Watch the end of the chain — AMQP consumer in eu-central-1
-./demo.sh amqp-consume
-```
-> Leave this running. It's consuming from RabbitMQ, which is fed by a Redpanda Connect pipeline reading from the shadow `iot-events` topic.
-
-**Terminal — window 2:**
-```bash
-# Publish MQTT events
-./demo.sh mqtt-publish 10
-```
-> Point to the asset types: store checkouts, warehouse conveyors, fleet telemetry. MQTT topic path is `iot/{region}/{asset_type}/{asset_id}/{event_type}`.
-
-Watch window 1 — messages appear with `routing_key=iot-events` and the full enriched JSON.
-
-**Full chain to narrate:**
-```
-MQTT pub → Mosquitto → Redpanda Connect → iot-events (eu-west-1)
-  → ShadowLink → iot-events (eu-central-1)
-    → Redpanda Connect → RabbitMQ → pika consumer
-```
-
-```bash
-# Show bridge pipeline health
-./demo.sh amqp-status
-```
-> Point to the consumer group lag — it should be 0 or near-0, showing the pipeline is keeping up.
-
-**Browser:** Show `iot-events` in Console eu-west-1. Click a message — show the enriched fields (`mqtt_topic`, `region`, `asset_type`, `asset_id`, `event_type`, `ingested_at`). These were added by the Redpanda Connect pipeline's Bloblang processor, not the original MQTT payload.
-
-**Key point:** The AMQP consumer doesn't know Redpanda exists. It's connecting to RabbitMQ. Any existing system that speaks AMQP can consume events from Redpanda without code changes.
-
----
-
-### Segment 3 — Selective Routing (~4 min)
-
-**What you're showing:** ShadowLink replicates based on policy, not blindly. You can pin sensitive or region-specific data to its origin cluster while still replicating shared event streams everywhere.
-
-**Terminal:**
-```bash
-./demo.sh routing
-```
-> This runs automatically — creates two topics, produces to both, counts down 35s, then shows the outcome. Narrate as it runs.
-
-While the countdown runs, explain the filter policy (from `clusters/region-b/shadowlink.yaml`):
-
-| Topic prefix | Rule | Behaviour |
-|---|---|---|
-| `regional-` | exclude (first match wins) | Stays in eu-west-1 only |
-| `*` | include | Replicates to eu-central-1 |
-
-After the countdown:
-- `global-alerts` → Replicated ✓
-- `regional-eu-west-1-ops` → Local only ✓
-
-**Key point:** This is how you enforce data residency requirements. EU-only operational data stays in the EU region. Shared business events cross regions. The policy lives in one YAML file.
-
----
-
-### Segment 4 — High Availability (~5 min)
-
-**What you're showing:** Single broker failure is transparent — Raft re-elects a leader, Kubernetes restarts the pod, the cluster heals itself. No pager, no manual steps.
-
-**Browser:** Open Grafana eu-west-1, navigate to the Redpanda Overview dashboard. Have it visible so you can point to the dip and recovery.
-
-**Terminal:**
-```bash
-./demo.sh chaos
-```
-> Narrate: "I'm deleting redpanda-0 with `--grace-period=0` — this is a hard kill, not a graceful shutdown." Watch the recovery polling print elapsed time.
-
-When recovery completes, the script prints the measured RTO (typically 30–90 seconds on m7gd.large EKS).
-
-**Browser:** Point to the Grafana timeline — you'll see a brief dip in the "Under-replicated partitions" panel, then it returns to 0 as the cluster recovers. No data was lost.
-
-**Key point:** This is Raft-based consensus — the cluster can absorb broker loss without operator intervention. In a 3-node cluster, you can lose one node and continue producing and consuming. 
-
----
-
-### Segment 5 — Disaster Recovery Failover (~8 min)
-
-**What you're showing:** When an entire region goes dark, promotion of the shadow cluster to primary is a single command. RTO is measured in seconds, not hours.
-
-> ⚠️  **This is the one irreversible step.** Run `./demo.sh restore` after to reset. Don't skip it if you need to run the demo again.
-
-**Terminal:**
-```bash
-./demo.sh failover
-```
-
-The script will:
-1. Print the pre-failover replication lag (**this is your RPO** — messages synced before the outage)
-2. Produce 10 messages to eu-west-1
-3. Simulate the outage (scale StatefulSet to 0 replicas)
-4. Watch ShadowLink detect the disconnection
-5. Run `rpk shadow failover --all --no-confirm`
-6. Prove eu-central-1 is writable by producing a test message
-7. Print RTO (outage start → first write to new primary)
-
-Narrate the RPO result as the lag prints: "These are the messages that synced before the outage. Everything in this window is available on eu-central-1 right now."
-
-**Browser:** After failover, refresh Console eu-central-1 — `retail-orders` is now a regular writable topic, not a shadow. Show that you can navigate to it and see the failover test message.
-
-**After the demo:**
-```bash
-./demo.sh restore
-```
-> Scales eu-west-1 back up, deletes the promoted topics, recreates the ShadowLink. Takes ~2 minutes.
-
----
-
-### Recovery Playbook
-
-Things that can go wrong and how to fix them:
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `preflight` shows ShadowLink not active | ShadowLink controller restarted | `kubectl --context rp-demo-eu-central-1 -n redpanda describe shadowlink eu-west-1-shadow` — check Events |
-| AMQP consumer not receiving messages | Connect pipeline restarted and lost connection | `kubectl --context rp-demo-eu-central-1 -n redpanda rollout restart deployment/connect-amqp-bridge` |
-| MQTT bridge not consuming | Client ID conflict after pod restart | `kubectl --context rp-demo-eu-west-1 -n redpanda rollout restart deployment/connect-mqtt-bridge` — wait 30s |
-| Shadow topics missing on eu-central-1 | ShadowLink sync hasn't run yet | Wait 30s and check `./demo.sh status` |
-| `chaos` — cluster doesn't recover | Pod stuck in Pending | `kubectl --context rp-demo-eu-west-1 -n redpanda describe pod redpanda-0` — look for PVC or node issues |
-| `failover` — `rpk shadow failover` fails | ShadowLink already disconnected or topics not ready | Check `rpk shadow status eu-west-1-shadow` on eu-central-1 |
-| Demo needs reset after failover | Forgot to run restore | `./demo.sh restore` — safe to run multiple times |
-
----
-
-## All Commands
-
-| Command | Description |
-|---|---|
-| `preflight` | Pre-meeting health check — verify all pods, links, and URLs |
-| `produce [n]` | Produce n order events to eu-west-1 (default: 10) |
-| `consume-source` | Consume `retail-orders` from eu-west-1 |
-| `consume-shadow` | Consume `retail-orders` from eu-central-1 |
-| `consume-both` | Both clusters side by side |
-| `status` | ShadowLink status and topic offsets |
-| `full-demo` | Fully scripted end-to-end demo |
-| `mqtt-publish [n]` | Publish n MQTT events via Mosquitto (default: 10) |
-| `mqtt-consume [source\|shadow]` | Consume `iot-events` as a Kafka client |
-| `mqtt-status` | MQTT bridge pipeline status and topic offsets |
-| `python-consume [source\|shadow]` | Python confluent-kafka consumer (retail-orders) |
-| `amqp-consume` | AMQP 0.9.1 consumer — end of MQTT→Kafka→AMQP chain |
-| `amqp-status` | RabbitMQ + AMQP bridge pipeline status |
-| `routing` | Policy-based topic routing: global vs regional-scoped topics |
-| `chaos` | Kill broker-0, measure self-healing RTO |
-| `failover` | Promote eu-central-1 shadow to primary (**irreversible**) |
-| `restore` | Scale eu-west-1 back up, recreate ShadowLink |
-
----
-
-## Observability
-
-Grafana is deployed on both clusters. Get URLs:
-
-```bash
-kubectl --context rp-demo-eu-west-1   -n monitoring get svc kube-prometheus-stack-grafana
-kubectl --context rp-demo-eu-central-1 -n monitoring get svc kube-prometheus-stack-grafana
-```
-
-Credentials: `admin` / retrieve password:
-```bash
-kubectl --context rp-demo-eu-west-1 -n monitoring get secret kube-prometheus-stack-grafana \
-  -o jsonpath='{.data.admin-password}' | base64 -d
-```
-
-Redpanda Console:
-```bash
-kubectl --context rp-demo-eu-west-1   -n redpanda get svc console
-kubectl --context rp-demo-eu-central-1 -n redpanda get svc console
+cat clusters/region-b/shadowlink.yaml \
+  | sed "s|ab14f1341b5a04455951a4c439736dab-638340892.eu-west-1.elb.amazonaws.com|$BROKER_0|g" \
+  | sed "s|ac89516824be94ebd9a1cd2b16ed6b92-1451718857.eu-west-1.elb.amazonaws.com|$BROKER_1|g" \
+  | sed "s|aa2598d94380b48f6b6c4619e7a40926-1282810100.eu-west-1.elb.amazonaws.com|$BROKER_2|g" \
+  | kubectl --context rp-demo-eu-central-1 apply -f -
 ```
 
 ---
@@ -279,8 +386,8 @@ demo/
 ├── setup.sh                         # Full environment provisioning (~30 min)
 ├── demo.sh                          # Interactive demo script
 ├── eks/
-│   ├── cluster-eu-west-1.yaml       # EKS cluster spec (primary, m7gd.large)
-│   └── cluster-eu-central-1.yaml    # EKS cluster spec (DR, m7gd.large)
+│   ├── cluster-eu-west-1.yaml       # EKS cluster spec (primary)
+│   └── cluster-eu-central-1.yaml    # EKS cluster spec (DR)
 ├── clusters/
 │   ├── region-a/                    # eu-west-1 manifests
 │   │   ├── redpanda.yaml            # Redpanda cluster (3-node, TLS, external LB)
@@ -292,7 +399,7 @@ demo/
 │   └── region-b/                    # eu-central-1 manifests
 │       ├── redpanda.yaml            # Redpanda cluster (3-node, TLS)
 │       ├── console.yaml             # Redpanda Console
-│       ├── shadowlink.yaml          # ShadowLink replication config + filter policy
+│       ├── shadowlink.yaml          # ShadowLink config — cn- excluded, * included
 │       └── amqp-bridge/
 │           ├── rabbitmq.yaml        # RabbitMQ 3-management
 │           ├── connect.yaml         # Redpanda Connect: iot-events → AMQP
@@ -306,19 +413,14 @@ demo/
 
 ---
 
-## Key Configuration Notes
+## Key Config Notes
 
-**TLS**: cert-manager provisions TLS on all Redpanda listeners. ShadowLink uses the source cluster's external CA cert, copied during setup to the `eu-west-1-ca-cert` Secret in eu-central-1.
+**ShadowLink filter policy** (`clusters/region-b/shadowlink.yaml`):
+- `cn-` prefix → excluded (China data stays local — Cyber Law compliance)
+- All other topics → included (replicates to eu-central-1)
 
-**ShadowLink sync interval**: 30 seconds for topic metadata, consumer offsets, and schema registry.
+**TLS**: cert-manager provisions TLS on all listeners. ShadowLink uses the source cluster's external CA cert, copied during setup to the `eu-west-1-ca-cert` Secret in eu-central-1.
 
-**Selective routing policy** (in `clusters/region-b/shadowlink.yaml`):
-- Topics prefixed `regional-` → excluded (stay in origin region)
-- All other topics → included (replicated to eu-central-1)
-- Rules evaluated in order; first match wins.
+**Failover is irreversible**: `rpk shadow failover` converts shadow topics to regular writable topics. The `restore` command handles cleanup.
 
-**Storage**: Local NVMe via LVM CSI (`csi-driver-lvm-striped-xfs` StorageClass). The `m7gd.large` instance provides one NVMe device at `/dev/nvme1n1`.
-
-**Failover is irreversible**: `rpk shadow failover` converts shadow topics to regular writable topics. The `restore` command handles cleanup by deleting those topics and recreating the ShadowLink resource.
-
-**MQTT client IDs**: The Redpanda Connect MQTT bridge uses client ID `rp-connect-mqtt-bridge`. If a pod restart causes a client ID conflict (old pod and new pod both trying to connect), Mosquitto will see a "session taken over" loop. A second `rollout restart` after the old pod fully terminates resolves it.
+**MQTT client IDs**: After pod restart, a second `rollout restart` may be needed if the old pod's session fights the new pod's connection (Mosquitto "session taken over" loop).
