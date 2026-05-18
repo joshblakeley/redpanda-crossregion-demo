@@ -20,16 +20,16 @@ eu-west-1 (primary / "EU cluster")                eu-central-1 (DR / "shadow clu
 │  (MQTT → Kafka bridge)           │              │      │                           │
 │      │                           │              │  RabbitMQ                        │
 │  Redpanda 3-node cluster         │──ShadowLink─▶│  Redpanda 3-node cluster         │
-│  retail-orders, iot-events       │  (eu- topics │  (shadow topics, read-only)      │
-│  eu-*, cn-* topics               │   replicate, │      │                           │
-│                                  │   cn-* don't)│  Python pika AMQP consumer       │
+│  retail-orders, iot-events       │  (regional-* │  (shadow topics, read-only)      │
+│                                  │   excluded,  │      │                           │
+│                                  │   * included)│  Python pika AMQP consumer       │
 │  Python confluent-kafka consumer │              │  Redpanda Console                │
 │  Redpanda Console                │              │  Prometheus + Grafana            │
 │  Prometheus + Grafana            │              └──────────────────────────────────┘
 └──────────────────────────────────┘
 
 ShadowLink filter policy (clusters/region-b/shadowlink.yaml):
-  cn-* prefix → EXCLUDED (China data stays local — Cyber Law)
+  regional-* prefix → EXCLUDED (stays in origin region only)
   everything else → INCLUDED (replicates to DR cluster)
 ```
 
@@ -190,7 +190,7 @@ kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shad
 
 Watch the countdown. After the result:
 - `eu-transaction-events` → replicated to DR cluster ✓
-- `cn-inventory-data` → local only ✓ (Cyber Law enforced at infrastructure layer)
+- `regional-eu-west-1-ops` → LOCAL ONLY ✓ (matched 'regional-' exclude rule)
 
 **Name Cyber Law compliance explicitly.** Chinese data didn't leave eu-west-1. That's not a naming convention — it's enforced by the broker before any data leaves the network.
 
@@ -324,7 +324,7 @@ Then Jeff asks: *"Can we schedule a follow-up architecture session with your ful
 | `mqtt-status` | 5 | MQTT bridge pipeline status |
 | `amqp-consume` | 5 | AMQP 0.9.1 consumer — end of MQTT→Kafka→AMQP chain |
 | `amqp-status` | 5 | RabbitMQ + AMQP bridge pipeline status |
-| `routing` | 6 | Data residency: `cn-` topics stay local, `eu-` topics replicate |
+| `routing` | 6 | Policy-based topic routing: global vs regional-scoped topics |
 | `chaos` | 7 | Kill broker-0, read RTO out loud |
 | `quotas` | 7 | Multi-tenancy: ACLs, per-client quotas, blast radius |
 | `failover` | 8 | Promote eu-central-1 to primary (**irreversible**) |
@@ -346,7 +346,6 @@ Then Jeff asks: *"Can we schedule a follow-up architecture session with your ful
 | `upgrade` — annotation doesn't trigger restart | `kubectl --context rp-demo-eu-west-1 -n redpanda rollout restart statefulset/redpanda` as fallback |
 | `quotas` — rpk quotas command fails | Quotas command syntax varies by version. Show ACLs and explain the quota model verbally |
 | Demo needs reset after failover | `./demo.sh restore` — safe to run multiple times |
-| cn- topic appears on eu-central-1 | ShadowLink filter change needs re-apply: `kubectl --context rp-demo-eu-central-1 apply -f clusters/region-b/shadowlink.yaml` |
 
 ---
 
@@ -358,23 +357,6 @@ cd demo/
 ```
 
 Provisions both EKS clusters, installs cert-manager + LVM CSI + kube-prometheus-stack, deploys Redpanda Operator, 3-node clusters, ShadowLink, MQTT bridge, AMQP bridge, and creates topics. Takes ~25–35 minutes.
-
-**After setup, apply the updated ShadowLink filter (cn- prefix):**
-```bash
-# The filter was updated from 'regional-' to 'cn-' to match the data residency demo
-BROKER_0=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-0 \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-BROKER_1=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-1 \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-BROKER_2=$(kubectl --context rp-demo-eu-west-1 -n redpanda get svc lb-redpanda-2 \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-
-cat clusters/region-b/shadowlink.yaml \
-  | sed "s|ab14f1341b5a04455951a4c439736dab-638340892.eu-west-1.elb.amazonaws.com|$BROKER_0|g" \
-  | sed "s|ac89516824be94ebd9a1cd2b16ed6b92-1451718857.eu-west-1.elb.amazonaws.com|$BROKER_1|g" \
-  | sed "s|aa2598d94380b48f6b6c4619e7a40926-1282810100.eu-west-1.elb.amazonaws.com|$BROKER_2|g" \
-  | kubectl --context rp-demo-eu-central-1 apply -f -
-```
 
 ---
 
@@ -399,7 +381,7 @@ demo/
 │   └── region-b/                    # eu-central-1 manifests
 │       ├── redpanda.yaml            # Redpanda cluster (3-node, TLS)
 │       ├── console.yaml             # Redpanda Console
-│       ├── shadowlink.yaml          # ShadowLink config — cn- excluded, * included
+│       ├── shadowlink.yaml          # ShadowLink config — regional- excluded, * included
 │       └── amqp-bridge/
 │           ├── rabbitmq.yaml        # RabbitMQ 3-management
 │           ├── connect.yaml         # Redpanda Connect: iot-events → AMQP
@@ -416,7 +398,7 @@ demo/
 ## Key Config Notes
 
 **ShadowLink filter policy** (`clusters/region-b/shadowlink.yaml`):
-- `cn-` prefix → excluded (China data stays local — Cyber Law compliance)
+- `regional-` prefix → excluded (stays in origin region only)
 - All other topics → included (replicates to eu-central-1)
 
 **TLS**: cert-manager provisions TLS on all listeners. ShadowLink uses the source cluster's external CA cert, copied during setup to the `eu-west-1-ca-cert` Secret in eu-central-1.

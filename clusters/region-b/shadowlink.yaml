@@ -22,7 +22,7 @@ spec:
   topicMetadataSyncOptions:
     interval: 30s
     autoCreateShadowTopicFilters:
-      - name: "cn-"
+      - name: "regional-"
         filterType: exclude
         patternType: prefixed
       - name: "*"

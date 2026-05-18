@@ -752,8 +752,8 @@ cmd_quotas() {
 # ── Data residency / selective routing demo ───────────────────────────────────
 
 cmd_routing() {
-  local EU_TOPIC="eu-transaction-events"
-  local CN_TOPIC="cn-inventory-data"
+  local EU_TOPIC="global-alerts"
+  local CN_TOPIC="regional-eu-west-1-ops"
 
   banner "Policy-Based Routing & Data Residency"
   info "\"Routing policy is code. It lives in your GitOps repository — every change is a"
@@ -769,22 +769,22 @@ cmd_routing() {
   step "1. Creating data residency demo topics on eu-west-1..."
   rp_exec "$CONTEXT_A" rpk topic create "$EU_TOPIC" --partitions 3 2>&1 || true
   rp_exec "$CONTEXT_A" rpk topic create "$CN_TOPIC"  --partitions 3 2>&1 || true
-  ok "Topics created: $EU_TOPIC (global), $CN_TOPIC (China-local)"
+  ok "Topics created: $EU_TOPIC (global), $CN_TOPIC (regional-local)"
   echo ""
 
   step "2. Producing 5 messages to each topic..."
   for i in $(seq 1 5); do
     local ts; ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    printf '{"txn_id":"TXN-%04d","store":"SE-Stockholm","amount":%.2f,"region":"EU","ts":"%s"}\n' \
-      "$((RANDOM % 9999))" "$(awk 'BEGIN{printf "%.2f",('"$RANDOM"'%9900)/100+1}')" "$ts" | \
+    printf '{"alert_id":"ALT-%04d","severity":"high","ts":"%s"}\n' \
+      "$((RANDOM % 9999))" "$ts" | \
       kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
-        rpk topic produce "$EU_TOPIC" --key "eu-$i" &>/dev/null || true
-    printf '{"inv_id":"INV-%04d","warehouse":"CN-Shanghai","units":%d,"region":"CN","ts":"%s"}\n' \
-      "$((RANDOM % 9999))" "$((RANDOM % 500 + 1))" "$ts" | \
+        rpk topic produce "$EU_TOPIC" --key "alert-$i" &>/dev/null || true
+    printf '{"op_id":"OPS-%04d","host":"broker-%d","ts":"%s"}\n' \
+      "$((RANDOM % 9999))" "$((i % 3))" "$ts" | \
       kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
-        rpk topic produce "$CN_TOPIC" --key "cn-$i" &>/dev/null || true
+        rpk topic produce "$CN_TOPIC" --key "ops-$i" &>/dev/null || true
   done
-  ok "Produced 5 EU transactions and 5 CN inventory records"
+  ok "Produced 5 messages to $EU_TOPIC (global) and 5 to $CN_TOPIC (regional)"
   echo ""
 
   step "3. Topics on eu-west-1 (source — both present):"
@@ -803,8 +803,7 @@ cmd_routing() {
   SHADOW_TOPICS=$(rp_exec "$CONTEXT_B" rpk topic list 2>/dev/null || echo "")
 
   if echo "$SHADOW_TOPICS" | grep -q "$EU_TOPIC"; then
-    ok "  $EU_TOPIC  → REPLICATED ✓"
-    info "     EU transaction data is globally available"
+    ok "  $EU_TOPIC  → REPLICATED ✓  (matches include-all rule)"
   else
     echo -e "  ${YELLOW}$EU_TOPIC → not yet synced (retry in a few seconds)${NC}"
   fi
@@ -812,15 +811,13 @@ cmd_routing() {
   if echo "$SHADOW_TOPICS" | grep -q "$CN_TOPIC"; then
     echo -e "  ${RED}  $CN_TOPIC → REPLICATED (unexpected — check filter config)${NC}"
   else
-    ok "  $CN_TOPIC         → LOCAL ONLY ✓"
-    info "     Chinese inventory data never left eu-west-1"
-    info "     Cyber Law compliance: enforced at infrastructure layer"
+    ok "  $CN_TOPIC → LOCAL ONLY ✓  (matched 'regional-' exclude rule)"
   fi
   echo ""
 
   step "6. This policy is a two-line YAML block in Git:"
   echo "     autoCreateShadowTopicFilters:"
-  echo "       - name: \"cn-\""
+  echo "       - name: \"regional-\""
   echo "         filterType: exclude"
   echo "         patternType: prefixed"
   echo "       - name: \"*\""
@@ -837,11 +834,13 @@ cmd_routing() {
   info "  permitted jurisdictions — enforced at infrastructure layer, not application layer."
   echo ""
 
-  banner "Data Residency Demo Complete"
-  ok "Policy enforced — cn- data stayed local, eu- data replicated:"
-  info "  For Martin (built the Solace mesh): policy-as-code beats a routing UI"
-  info "  For Nihar: governance is part of SL1 platform requirements"
-  info "  For the room: this is how you satisfy Cyber Law without application changes"
+  banner "Routing Demo Complete"
+  ok "Policy-based selective distribution confirmed:"
+  info "  global-*   topics → replicated to all regions"
+  info "  regional-* topics → scoped to origin region only"
+  info ""
+  info "For Martin (built the Solace mesh): policy-as-code beats a routing UI"
+  info "For Nihar: governance is part of SL1 platform requirements"
   info ""
   info "To clean up:"
   info "  kubectl --context $CONTEXT_A -n redpanda exec redpanda-0 -c redpanda -- rpk topic delete $EU_TOPIC $CN_TOPIC"
