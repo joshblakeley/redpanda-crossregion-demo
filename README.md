@@ -1,11 +1,8 @@
 # Redpanda Cross-Region Demo
-## IKEA (Ingka Group) — Event Messaging Platform Evaluation
+## Enterprise Event Messaging Platform — SE Demo Runsheet
 
-**Demo**: Wed 20 May 2026, 10:00 AM BST  
-**Format**: 90 minutes, 9 segments — Jeff owns bookends, Josh owns technical segments  
-**Evaluators**: Nihar Shah (Eng Leader, decision-maker), Martin Hilferink (Sr Tech Architect), Subhasish Bhabani (Solace Operator), Björn Ramberg (Exec Sponsor)
-
-> This is not a Solace replacement demo. It's "build the event infrastructure that will run IKEA's AI agent estate for the next five years." Surface this at the close.
+**Format**: ~90 minutes, 9 segments  
+**Audience**: Engineering leaders, platform architects, operations teams evaluating Redpanda as an enterprise event streaming platform
 
 ---
 
@@ -52,52 +49,49 @@ Checks every pod, ShadowLink state, both topics, and prints Console + Grafana UR
 - Console eu-central-1 (`:8080`) — shadow topic confirmation
 - Grafana eu-west-1 — Redpanda Overview dashboard (keep visible during chaos + DR)
 
-**⚠ Say this proactively in Segment 0:** *"Our demo runs on AWS EKS — the operator and broker are cloud-agnostic, identical on GCP GKE, Azure AKS, on-prem Kubernetes, and AliCloud ACK. Ingka's environment is all four of those."* Don't wait to be asked.
+**State cloud-agnosticism proactively in Segment 0:**
+> *"Our demo runs on AWS EKS — the operator and broker are cloud-agnostic and run identically on GCP GKE, Azure AKS, on-prem Kubernetes, and AliCloud ACK."*
 
 ---
 
 ## Demo Flow — 90 Minutes
 
-### Segment 0 — Context Setting (5 min) | Jeff
+### Segment 0 — Context Setting (5 min)
 
-Jeff opens. Two jobs for this segment:
+Open with two goals:
 
-**1. Acknowledge the 2023 evaluation generically — don't name Bruno:**
-> *"We know your team looked at Redpanda before — here's what has changed."*  
+**1. Acknowledge what has changed since any prior evaluation:**
+> *"Here's what has changed."*  
 Three things on one slide: Schema Registry built-in (GA 2023), Tiered Storage GA, Operator-driven scale-down automated.
 
 **2. State cloud-agnosticism immediately:**
 > *"Our demo runs on AWS EKS. The operator and broker are identical on GCP GKE, Azure AKS, on-prem Kubernetes, and AliCloud ACK — same YAML, same GitOps model, same day-2 behaviour."*
 
-**Josh picks up with:**
-> *"Most vendors will show you a Solace replacement today. We want to show you something different — the streaming backbone for your AI Agent gateways, your data mesh, your inference pipelines, and your compliance logging. The Solace migration is the entry point. The AI infrastructure is where this platform goes."*
+Transition with:
+> *"Most vendors will show you a legacy messaging replacement today. We want to show you something different — the streaming backbone for your AI Agent gateways, your data mesh, your inference pipelines, and your compliance logging."*
 
 ---
 
-### Segment 1 — Current → Future Architecture Recap (5–7 min) | Jeff
+### Segment 1 — Current → Future Architecture Recap (5–7 min)
 
-Single slide showing what Redpanda understands about the current Solace estate and target state.
+Single slide showing what Redpanda understands about the current estate and target state.
 
 **Cover explicitly:**
-- What's being replaced: Solace event mesh (Sweden on-prem, GCP, AliCloud, Azure, AWS) + Kong+Solace Partner Portal + SMF protocol translation
-- Target state: self-hosted K8s-native, AliCloud included, 10K msg/sec, 500–1,000 consumers across 50+ markets, 80–95% tiered storage offload
-- Three things that matter most: zero message loss on failover for SL1 platforms, minimal ops overhead, migration path with no day-one Solace refactoring
+- What's being replaced: existing event mesh + protocol translation layer
+- Target state: self-hosted K8s-native, multi-cloud, high-throughput, large consumer footprint
+- Three things that matter most: zero message loss on failover for critical platforms, minimal ops overhead, migration path with no day-one refactoring
 
-**Invite correction:** *"Before Josh opens a terminal, does this match your topology? Correct us now."*
-
-> **Why this matters:** Shows Subhasish exactly what happens to his existing producers (bridge path, no day-one refactoring). Shows Martin that the Kong+Solace translation layer disappears entirely.
+**Invite correction:** *"Before we open a terminal, does this match your topology? Correct us now."*
 
 ---
 
-### Segment 2 — Reference Customer (3–4 min) | Jeff
+### Segment 2 — Reference Customer (3–4 min)
 
-Large global enterprise, self-hosted BYOC, multi-region, migration from legacy messaging, or regulated data residency. Retail or IoT-heavy reference preferred. Objective: prove Redpanda has done this migration before, not just greenfield deployments.
+Large global enterprise, self-hosted, multi-region, migration from legacy messaging, or regulated data residency. Match the reference customer profile to the prospect's industry and use case.
 
 ---
 
-### Segment 3 — Kubernetes-Native Platform & GitOps (8 min) | Josh
-
-**Assessment: STRONG. Frame for Nihar (25% cost reduction) and Björn (governance).**
+### Segment 3 — Kubernetes-Native Platform & GitOps (8 min)
 
 ```bash
 # Start a live producer in the background first, then trigger the rolling restart
@@ -112,16 +106,14 @@ Watch the counter — messages produced during the rolling restart, messages los
 **Browser:** Point to Grafana — under-replicated partitions briefly non-zero per broker, returns to 0 as each one rejoins. No producer interruption.
 
 **Key hits:**
-- **Nihar:** "This is how you get from 'reducing operational costs' to 25% — the operator handles every upgrade, every patch, every scale event."
-- **Björn:** "Governance and enablement for the entire Ingka developer community — every infrastructure change is a PR."
+- **Cost:** "This is how you reduce operational costs — the operator handles every upgrade, every patch, every scale event."
+- **Governance:** "Every infrastructure change is a pull request — full audit trail for the entire development community."
 
 **ADP connection:** *"This is also how AI agent infrastructure gets deployed and managed at scale — same operator model runs your streaming platform and your AI event infrastructure."*
 
 ---
 
-### Segment 4 — Cross-Region Replication / ShadowLink (8 min) | Josh
-
-**Assessment: STRONG. Land offset-sync and schema registry sync explicitly — Nihar's most critical requirement.**
+### Segment 4 — Cross-Region Replication / ShadowLink (8 min)
 
 ```bash
 ./demo.sh produce 20       # produce to eu-west-1
@@ -132,7 +124,7 @@ Watch the counter — messages produced during the rolling restart, messages los
 State explicitly:
 > *"When the primary region fails, consumers switch to the DR cluster and resume from exactly the last message they processed. No replay. No data loss. No reconfiguration."*
 
-**Explicitly call out schema registry sync** — Ingka has an existing schema registry and a migration path concern. Point to the `schemaRegistrySyncOptions` in shadowlink.yaml:
+**Explicitly call out schema registry sync:**
 ```bash
 kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shadow -o yaml | grep -A5 schemaRegistry
 ```
@@ -140,16 +132,14 @@ kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shad
 **Browser:** Show Grafana — throughput dropping on primary, coming up on DR.
 
 **Key hits:**
-- **Nihar:** "SL1 for 50+ markets — schema registry sync means your consumer contracts stay intact across a regional failure."
-- **Schema registry:** Redpanda built-in SR is Confluent SR API-compatible — existing SR tooling works.
+- "Consumer group offsets replicate cross-region — schema registry sync means your consumer contracts stay intact across a regional failure."
+- "Redpanda's built-in SR is Confluent SR API-compatible — existing SR tooling works."
 
 **ADP connection:** *"The same replication that protects your operational event flows also replicates agent context, inference logs, and model event streams across regions — without loss, without replay."*
 
 ---
 
-### Segment 5 — Protocol Bridging + Solace Migration Architecture (12 min) | Josh
-
-**Assessment: NEEDS PROACTIVE FRAMING. Own the RabbitMQ before anyone asks. Add Solace migration path.**
+### Segment 5 — Protocol Bridging + Migration Architecture (12 min)
 
 ```bash
 # Terminal 1: watch the end of the chain
@@ -162,51 +152,47 @@ kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shad
 **Own the RabbitMQ immediately:**
 > *"We're using RabbitMQ here as an AMQP endpoint to illustrate the pattern — in your environment this is any AMQP consumer. Redpanda Connect handles protocol translation at the edge; the broker stays pure Kafka API throughout."*
 
-**For Subhasish — walk the Solace migration path explicitly:**
-> *"Connect has a Solace SMF source connector. Your existing producers stay on Solace. Events bridge into Redpanda. Consumers migrate at their own pace. Week one looks like this: nothing changes for your 250+ SMF-connected endpoints. They keep publishing to Solace. Connect reads from Solace and writes to Redpanda. Migration is topic-by-topic, team-by-team."*
+**Walk the migration path explicitly:**
+> *"Connect has source connectors for legacy messaging systems. Your existing producers keep publishing where they are. Events bridge into Redpanda. Consumers migrate at their own pace. Migration is topic-by-topic, team-by-team."*
 
-**Tie to MQTT/IKEA reality:**
-- 250+ warehouse drones at 73 locations → MQTT → Redpanda Connect → `iot-events` topic
-- This is directly how IKEA's IoT estate works today
+**Tie to IoT reality:**
+- Edge devices at distributed locations → MQTT → Redpanda Connect → `iot-events` topic
+- This pattern directly mirrors how distributed IoT estates work today
 
 ```bash
 ./demo.sh amqp-status     # show pipeline health, consumer group lag
 ```
 
-**ADP connection:** *"The same Connect pipeline that ingests MQTT telemetry from your 250 warehouse drones is also how sensor data feeds AI pipelines in real time — computer vision, inventory models, drone autonomy. You're not building two pipelines. You're building one."*
+**ADP connection:** *"The same Connect pipeline that ingests MQTT telemetry from edge devices is also how sensor data feeds AI pipelines in real time — computer vision, inventory models, autonomous systems. You're not building two pipelines. You're building one."*
 
 ---
 
-### Segment 6 — Policy-Based Routing & Data Residency (6 min) | Josh
-
-**Assessment: WEAKEST SEGMENT. Reframe as GitOps governance and EU AI Act infrastructure. Don't show it as a two-line filter — show it as the architecture of compliance.**
+### Segment 6 — Policy-Based Routing & Data Residency (6 min)
 
 ```bash
 ./demo.sh routing
 ```
 
-**Lead with the reframe for Martin** (who built the Solace mesh and knows what Solace's routing UI looks like):
+**Lead with the governance reframe:**
 > *"Routing policy is code. It lives in your GitOps repository — every change is a pull request with a reviewer and a complete audit trail. That's a stronger governance model than a UI where a routing rule can be changed with a click and no record."*
 
 Watch the countdown. After the result:
-- `eu-transaction-events` → replicated to DR cluster ✓
+- `global-alerts` → replicated to DR cluster ✓
 - `regional-eu-west-1-ops` → LOCAL ONLY ✓ (matched 'regional-' exclude rule)
 
-**Name Cyber Law compliance explicitly.** Chinese data didn't leave eu-west-1. That's not a naming convention — it's enforced by the broker before any data leaves the network.
+**Name data residency compliance explicitly.** Regional data didn't leave its origin region. That's not a naming convention — it's enforced by the broker before any data leaves the network.
 
 **Browser:** Show Console → Audit Log. Every ShadowLink filter change, every ACL update, every topic creation is logged. This is the governance trail.
 
 **Key hits:**
-- **Martin:** Policy-as-code resonates with his MCP/AI gateway direction — same model as his API gateway governance
-- **Nihar:** Governance is part of SL1 platform requirements
+- Policy-as-code aligns with modern API gateway governance — same model, consistent mental model across teams
+- Data residency is enforced at the infrastructure layer, not the application layer — satisfies regulatory requirements automatically
 
-**ADP connection:** *"Data residency enforcement at the broker layer is also how you satisfy the EU AI Act's requirement that model training data and inference inputs are processed only in permitted jurisdictions — enforced at the infrastructure layer, not the application layer."*
+**ADP connection:** *"Data residency enforcement at the broker layer is also how you satisfy AI Act and similar regulatory requirements that model training data and inference inputs are processed only in permitted jurisdictions."*
 
 ---
 
-### Segment 7 — High Availability + Multi-Tenancy (5 min) | Josh
-
-**Assessment: STRONG. Kill the broker AND show blast radius after — Section 5.3 of demo requirements asks for multi-tenancy explicitly.**
+### Segment 7 — High Availability + Multi-Tenancy (5 min)
 
 ```bash
 # Kill broker-0, read the RTO out loud
@@ -226,13 +212,11 @@ This shows namespaces, ACLs, per-client throughput quotas, and rate limiting. Wa
 2. ACL: can only access `tenant-a-events` — no access to other teams' topics
 3. Throughput quota: 5 MB/s produce, 10 MB/s consume — one team's surge can't starve others
 
-**Key hit for Nihar:** Blast radius containment is a day-1 operational requirement for a 50+ market platform. This is not theoretical.
+**Key hit:** Blast radius containment is a day-1 operational requirement for any large multi-team platform. This is not theoretical.
 
 ---
 
-### Segment 8 — Disaster Recovery (10 min) | Josh
-
-**Assessment: STRONG. Add Grafana visibility. Close the 2023 'infinite retention' objection.**
+### Segment 8 — Disaster Recovery (10 min)
 
 ```bash
 # Walk through restore flow BEFORE triggering — show the recovery path
@@ -247,58 +231,55 @@ Point to `./demo.sh restore` in the README.
 - **Browser (Grafana):** throughput dropping on eu-west-1, coming up on eu-central-1 — show the transition
 - **Browser (Console):** point to `retail-orders` on eu-central-1 going from read-only shadow to writable
 
-**Close the 2023 'infinite retention' objection** (without naming Bruno):
-> *"One concern from a previous evaluation was that Redpanda was disk-bound. Tiered Storage offloads 80–95% of data to object storage — S3, GCS, AliOSS. Consumers read historical data transparently — no difference between a message from yesterday and a message from six months ago."*
+**Close the disk-bound / infinite retention objection:**
+> *"Tiered Storage offloads 80–95% of data to object storage — S3, GCS, AliOSS. Consumers read historical data transparently — no difference between a message from yesterday and a message from six months ago."*
 
-**Show 10MB payload support (if not shown earlier):**
+**Show 10MB payload support:**
 ```bash
 ./demo.sh produce-large
 ```
-> *"Your RFI states some publishers up to 10MB. Handled."*
+> *"Large payload support is handled natively — up to 10MB messages, no broker configuration changes."*
 
 **Key hits:**
-- **Subhasish:** Ops console view of the failover — this is his day job
-- **Everyone:** Seamless historical read from tiered storage = infinite retention objection closed
+- Ops console view of the failover — show the operational experience
+- Seamless historical read from tiered storage = no retention limits
 
 ---
 
-### Segment 9 — Iceberg + ADP Close (5 min) | Jeff
+### Segment 9 — Forward Platform Story & Close (5 min)
 
-Jeff closes with the forward-looking platform investment story:
+Close with the forward-looking platform investment story:
 
-> *"You came here evaluating a Solace replacement. What you're actually selecting is the streaming backbone for the next five years of your data and AI architecture."*
+> *"You came here evaluating a messaging platform replacement. What you're actually selecting is the streaming backbone for the next five years of your data and AI architecture."*
 
 Three points:
-- **Iceberg-compatible tiered storage:** 80–95% offloaded to object storage is queryable directly from Databricks, Snowflake — no pulling through the broker. Martin has Databricks in the stack already.
-- **EU AI Act audit trail:** Redpanda's immutable append-only log is architecturally aligned with AI Act inference logging requirements.
-- **Agentic Data Plane:** Martin is building MCP servers and AI Agent gateways right now. The event infrastructure those agents need — real-time context delivery, agent-to-agent communication, tool call event streams — is exactly what Redpanda was built for.
+- **Iceberg-compatible tiered storage:** 80–95% offloaded to object storage is queryable directly from Databricks, Snowflake — no pulling through the broker.
+- **Regulatory audit trail:** Redpanda's immutable append-only log is architecturally aligned with AI Act inference logging requirements.
+- **Agentic Data Plane:** The event infrastructure that AI agents need — real-time context delivery, agent-to-agent communication, tool call event streams — is exactly what Redpanda was built for.
 
-Close line: *"The Solace migration funds the AI infrastructure. Same cluster, same data, same guarantees."*
+Close line: *"The legacy migration funds the AI infrastructure. Same cluster, same data, same guarantees."*
 
-Then Jeff asks: *"Can we schedule a follow-up architecture session with your full platform team before the RFP document drops?"*
+Follow up: *"Can we schedule an architecture session with your full platform team?"*
 
 ---
 
 ## Key Landmines to Pre-empt
 
-| Landmine | Who Raises It | Pre-emption |
-|---|---|---|
-| Demo runs on AWS, we're on GCP/Azure/AliCloud | Martin or Subhasish | State in Segment 0: operator is cloud-agnostic, identical on GCP GKE, Azure AKS, on-prem K8s, AliCloud ACK |
-| Why is there a RabbitMQ? | Subhasish | Own it in Segment 5 before they ask — frame as edge translation pattern, not a dependency |
-| Policy routing looks thin vs Solace mesh UI | Martin (built the Solace mesh) | GitOps reframe: policy is code, lives in Git, every change is a PR. Stronger governance than a UI |
-| Migration path for 250+ Solace endpoints | Subhasish | Connect Solace SMF source connector = no day-one refactoring. Migration is incremental, topic-by-topic |
-| Can you really run on AliCloud? | Any evaluator | Immediate, confident: self-hosted on AliCloud ACK, same operator, same GitOps model |
-| Vendor stability — 5-year platform bet | Björn (5 months in role) | Funding, ARR trajectory, customer logos, independence from IBM/Confluent |
-| Demo shows 2 regions, we have 5+ across 4 clouds | Any evaluator | ShadowLink scales to N clusters. Routing policy is additive YAML. Show the pattern — scale follows |
-| Schema registry compatibility | Subhasish | Built-in SR GA since 2023. Full Confluent SR API compatibility. External SR also supported |
-
-**Do NOT name Bruno Gouveia.** He ran the 2023 evaluation and knows Redpanda's historical gaps. Address his objections (scale-down, infinite retention, schema registry) proactively in the demo flow without referencing him.
+| Landmine | Pre-emption |
+|---|---|
+| Demo runs on AWS, we're on GCP/Azure/AliCloud | State in Segment 0: operator is cloud-agnostic, identical on GCP GKE, Azure AKS, on-prem K8s, AliCloud ACK |
+| Why is there a RabbitMQ? | Own it in Segment 5 before they ask — frame as edge translation pattern, not a dependency |
+| Policy routing looks thin vs legacy mesh UI | GitOps reframe: policy is code, lives in Git, every change is a PR. Stronger governance than a UI |
+| Migration path for existing endpoints | Connect source connectors = no day-one refactoring. Migration is incremental, topic-by-topic |
+| Can you really run on AliCloud? | Immediate, confident: self-hosted on AliCloud ACK, same operator, same GitOps model |
+| Demo shows 2 regions, we have more | ShadowLink scales to N clusters. Routing policy is additive YAML. Show the pattern — scale follows |
+| Schema registry compatibility | Built-in SR GA since 2023. Full Confluent SR API compatibility. External SR also supported |
 
 ---
 
-## 2023 Objections — Close Them Proactively
+## Common Objections — Close Them Proactively
 
-| 2023 Concern | Answer |
+| Concern | Answer |
 |---|---|
 | Record deletion | Compacted topics + tombstone records. Key-based delete via null-value record. GDPR-compliant pattern. |
 | Scale-down was painful | Operator: automated decommission with partition rebalance. Tiered storage reduces data volume moved during scale-down. |
