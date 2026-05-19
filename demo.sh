@@ -1089,12 +1089,6 @@ cmd_routing() {
   info "  has an audit trail. That's the governance model for a Cyber Law environment."
   echo ""
 
-  step "7. ADP connection — EU AI Act:"
-  info "  Data residency enforcement at the broker layer is how you satisfy the EU AI Act's"
-  info "  requirement that model training data and inference inputs are processed only in"
-  info "  permitted jurisdictions — enforced at infrastructure layer, not application layer."
-  echo ""
-
   banner "Routing Demo Complete"
   ok "Policy-based selective distribution confirmed across AWS + GCP:"
   info "  global-*   topics → replicated to eu-central-1 (AWS) AND europe-west4 (GCP)"
