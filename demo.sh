@@ -517,49 +517,92 @@ cmd_consume_all() {
 
 cmd_status() {
   banner "ShadowLink Status"
+  info "Snapshot taken at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo ""
 
-  step "ShadowLink resource (eu-central-1):"
-  kubectl --context "$CONTEXT_B" -n redpanda get shadowlink eu-west-1-shadow \
-    -o custom-columns=\
+  # ── 1. ShadowLink resource state on both destination clusters ────────────
+  step "1. ShadowLink resource state — both shadow clusters:"
+  for SHADOW_CTX in "$CONTEXT_B" "$CONTEXT_C"; do
+    case "$SHADOW_CTX" in
+      "$CONTEXT_B") LABEL="eu-central-1 (AWS)" ;;
+      "$CONTEXT_C") LABEL="europe-west4 (GCP)" ;;
+    esac
+    info "  ── $LABEL ──"
+    kubectl --context "$SHADOW_CTX" -n redpanda get shadowlink "$SHADOW_LINK" \
+      -o custom-columns=\
 'NAME:.metadata.name,STATE:.status.state,SYNCED:.status.conditions[0].status,MESSAGE:.status.conditions[0].message' \
+      2>&1 | sed 's/^/    /' || true
+    echo ""
+  done
+
+  # ── 2. ShadowLink per-partition lag (source vs destination HWM) ─────────
+  step "2. ShadowLink replication lag for retail-orders (per partition):"
+  info "  SRC_HWM = source high watermark, DST_HWM = destination high watermark, LAG = source − destination"
+  echo ""
+  for SHADOW_CTX in "$CONTEXT_B" "$CONTEXT_C"; do
+    case "$SHADOW_CTX" in
+      "$CONTEXT_B") LABEL="eu-central-1 (AWS)" ;;
+      "$CONTEXT_C") LABEL="europe-west4 (GCP)" ;;
+    esac
+    info "  ── $LABEL ──"
+    # awk: print only the retail-orders block (between "Name: retail-orders" and the next "Name:" header)
+    rp_exec "$SHADOW_CTX" rpk shadow status "$SHADOW_LINK" --print-topic 2>&1 \
+      | awk -v topic="$TOPIC" '
+          /^Name: / { in_block = ($0 ~ "Name: " topic ","); next }
+          in_block { print }
+        ' \
+      | sed 's/^/    /' || true
+    echo ""
+  done
+
+  # ── 3. Active replication tasks ──────────────────────────────────────────
+  step "3. Active ShadowLink tasks (eu-central-1):"
+  kubectl --context "$CONTEXT_B" -n redpanda get shadowlink "$SHADOW_LINK" \
+    -o jsonpath='{range .status.taskStatuses[*]}    {.name}{" (broker "}{.brokerId}{"): "}{.state}{"\n"}{end}' \
     2>&1
   echo ""
 
-  step "Active tasks per broker:"
-  kubectl --context "$CONTEXT_B" -n redpanda get shadowlink eu-west-1-shadow \
-    -o jsonpath='{range .status.taskStatuses[*]}{.name}{" (broker "}{.brokerId}{"): "}{.state}{"\n"}{end}' \
-    2>&1
+  # ── 4. Consumer group offset sync ────────────────────────────────────────
+  step "4. Consumer group offset sync (ShadowLink replicates committed offsets):"
+  info "  Source clients commit offsets here. ShadowLink replicates them to both shadow"
+  info "  clusters under a renamed group, so a consumer attaching after failover resumes"
+  info "  from the exact last commit. No replay, no skipped messages."
   echo ""
 
-  step "Topic offsets — eu-west-1 (source):"
-  rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>&1 || true
-  echo ""
+  # ShadowLink renames groups with a per-cluster suffix.
+  # Find a Stable group matching our base name on each cluster.
+  for CTX in "$CONTEXT_A" "$CONTEXT_B" "$CONTEXT_C"; do
+    case "$CTX" in
+      "$CONTEXT_A") LABEL="eu-west-1 (source)" ;;
+      "$CONTEXT_B") LABEL="eu-central-1 (AWS shadow)" ;;
+      "$CONTEXT_C") LABEL="europe-west4 (GCP shadow)" ;;
+    esac
+    info "  ── $LABEL ──"
+    # Discover groups that look like our retail consumer (base + optional suffix)
+    GRP=$(rp_exec "$CTX" rpk group list 2>/dev/null \
+      | awk -v base="$GROUP" 'NR>1 && $2 ~ "^"base { print $2; exit }')
+    if [[ -z "$GRP" ]]; then
+      info "    (no group matching $GROUP* found)"
+      echo ""
+      continue
+    fi
+    rp_exec "$CTX" rpk group describe "$GRP" 2>&1 \
+      | awk -v topic="$TOPIC" '
+          /^GROUP / || /^STATE / || /^MEMBERS / || /^TOTAL-LAG / { print; next }
+          /^TOPIC[[:space:]]/ {
+            printf "%-14s %-10s %-15s %-18s %-15s %-10s\n", "TOPIC", "PARTITION", "CURRENT-OFFSET", "LOG-START-OFFSET", "LOG-END-OFFSET", "LAG"
+            printed_hdr = 1; next
+          }
+          $1 == topic {
+            printf "%-14s %-10s %-15s %-18s %-15s %-10s\n", $1, $2, $3, $4, $5, $6
+          }
+        ' \
+      | sed 's/^/    /' || true
+    echo ""
+  done
 
-  step "Topic offsets — eu-central-1 (shadow):"
-  rp_exec "$CONTEXT_B" rpk topic describe "$TOPIC" -p 2>&1 || true
-  echo ""
-
-  step "Topic offsets — europe-west4 (shadow, GCP):"
-  rp_exec "$CONTEXT_C" rpk topic describe "$TOPIC" -p 2>&1 || true
-  echo ""
-
-  step "ShadowLink status (europe-west4):"
-  kubectl --context "$CONTEXT_C" -n redpanda get shadowlink "$SHADOW_LINK" \
-    -o custom-columns=\
-'NAME:.metadata.name,STATE:.status.state,SYNCED:.status.conditions[0].status,MESSAGE:.status.conditions[0].message' \
-    2>&1 || true
-  echo ""
-
-  step "Consumer group offsets — eu-west-1 (source):"
-  rp_exec "$CONTEXT_A" rpk group describe "$GROUP" 2>&1 || true
-  echo ""
-
-  step "Consumer group offsets — eu-central-1 (shadow — synced by ShadowLink):"
-  rp_exec "$CONTEXT_B" rpk group describe "$GROUP" 2>&1 || true
-  echo ""
-
-  step "Consumer group offsets — europe-west4 (shadow — synced by ShadowLink):"
-  rp_exec "$CONTEXT_C" rpk group describe "$GROUP" 2>&1 || true
+  info "Group naming convention is configurable per ShadowLink (here: -source, -shadow, -gcp"
+  info "suffixes). The CURRENT-OFFSET column is what a new consumer would resume from."
 }
 
 cmd_full_demo() {
