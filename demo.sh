@@ -52,7 +52,9 @@ grafana_annotate() {
   local grafana_svc="kube-prometheus-stack-grafana"
   local grafana_host grafana_pass
   grafana_host=$(kubectl --context "$ctx" -n monitoring get svc "$grafana_svc" \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  [[ -z "$grafana_host" ]] && grafana_host=$(kubectl --context "$ctx" -n monitoring get svc "$grafana_svc" \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
   [[ -z "$grafana_host" ]] && return 0
   grafana_pass=$(kubectl --context "$ctx" -n monitoring get secret "$grafana_svc" \
     -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
@@ -232,14 +234,23 @@ cmd_preflight() {
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   CONSOLE_B=$(kubectl --context "$CONTEXT_B" -n redpanda get svc console \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-  CONSOLE_C=$(kubectl --context "$CONTEXT_C" -n redpanda get svc console \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  # GCP assigns an IP, not a hostname — try hostname first, fall back to ip
+  _lb_addr() {
+    local ctx="$1" ns="$2" svc="$3"
+    local host ip
+    host=$(kubectl --context "$ctx" -n "$ns" get svc "$svc" \
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+    [[ -n "$host" ]] && echo "$host" && return
+    ip=$(kubectl --context "$ctx" -n "$ns" get svc "$svc" \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+    echo "$ip"
+  }
+  CONSOLE_C=$(_lb_addr "$CONTEXT_C" redpanda console)
   GRAFANA_A=$(kubectl --context "$CONTEXT_A" -n monitoring get svc kube-prometheus-stack-grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   GRAFANA_B=$(kubectl --context "$CONTEXT_B" -n monitoring get svc kube-prometheus-stack-grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-  GRAFANA_C=$(kubectl --context "$CONTEXT_C" -n monitoring get svc kube-prometheus-stack-grafana \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  GRAFANA_C=$(_lb_addr "$CONTEXT_C" monitoring kube-prometheus-stack-grafana)
   GRAFANA_PASS_A=$(kubectl --context "$CONTEXT_A" -n monitoring get secret kube-prometheus-stack-grafana \
     -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
   GRAFANA_PASS_B=$(kubectl --context "$CONTEXT_B" -n monitoring get secret kube-prometheus-stack-grafana \
