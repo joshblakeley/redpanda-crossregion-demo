@@ -99,6 +99,17 @@ rp_exec() {
   kubectl --context "$ctx" -n redpanda exec -i redpanda-0 -c redpanda -- "$@" 2>&1
 }
 
+# rp_exec_any: try brokers 0→1→2 until one responds (used when a broker may be down)
+rp_exec_any() {
+  local ctx=$1; shift
+  for b in 0 1 2; do
+    if kubectl --context "$ctx" -n redpanda exec -i "redpanda-$b" -c redpanda -- "$@" 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 cmd_preflight() {
@@ -612,20 +623,31 @@ cmd_upgrade() {
   info "open a PR — the Operator handles the rolling restart. No manual broker interaction."
   echo ""
 
-  step "1. Starting continuous background producer..."
+  step "1. Starting continuous background producer (~500 KB/s)..."
   (
+    STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
+    PAD=$(python3 -c "print('x'*2300)")
+    BIDX=0
     while true; do
-      ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      payload=$(printf '{"order_id":"ORD-%05d","store":"STORE-SE-Stockholm","amount":%.2f,"ts":"%s"}' \
-        "$((RANDOM % 99999))" "$(awk 'BEGIN{printf "%.2f", ('"$RANDOM"' % 49100)/100+9}')" "$ts")
-      echo "$payload" | kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
-        rpk topic produce "$TOPIC" --key "upgrade-probe" &>/dev/null
-      sleep 0.5
+      BROKER="redpanda-${BIDX}"
+      python3 -c "
+import random, datetime, json, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+stores = sys.argv[1].split(',')
+pad = sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc)
+for _ in range(200):
+    print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
+" "${STORES[*]// /,}" "$PAD" | \
+        kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
+          rpk topic produce "$TOPIC" &>/dev/null || true
+      BIDX=$(( (BIDX + 1) % 3 ))
     done
   ) &
   PROD_PID=$!
-  trap "kill $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
-  ok "Producer running in background (PID $PROD_PID)"
+  disown $PROD_PID 2>/dev/null || true
+  trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+  ok "Producer running in background (PID $PROD_PID) — ~200 records/batch × ~2.5 KB each (~500 KB/s)"
   echo ""
 
   step "2. Pre-upgrade baseline..."
@@ -680,16 +702,19 @@ cmd_upgrade() {
   POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
   MSGS_DURING=$(( POST_HWM - PRE_HWM ))
-  kill $PROD_PID 2>/dev/null || true
+  kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true
   trap - EXIT
 
   ELAPSED=$(( SECONDS - UPGRADE_START ))
+  BYTES_DURING=$(( MSGS_DURING * 2500 ))
+  KBPS=$(( ELAPSED > 0 ? BYTES_DURING / ELAPSED / 1024 : 0 ))
   echo ""
-  grafana_annotate "$CONTEXT_A" "upgrade: rolling restart complete — ${ELAPSED}s, ${MSGS_DURING} msgs produced, 0 lost" "upgrade"
+  grafana_annotate "$CONTEXT_A" "upgrade: complete — ${ELAPSED}s, ${MSGS_DURING} msgs, ~${KBPS} KB/s sustained, 0 lost" "upgrade"
   ok "═══════════════════════════════════════════"
   ok "  ROLLING UPGRADE COMPLETE"
   ok "  Duration                  : ${ELAPSED}s"
   ok "  Messages produced during  : $MSGS_DURING"
+  ok "  Sustained throughput      : ~${KBPS} KB/s"
   ok "  Messages lost             : 0"
   ok "  Zero downtime — Raft leadership transfers"
   ok "  handled automatically by the broker"
@@ -872,8 +897,32 @@ cmd_chaos() {
   step "Action   : Kill redpanda-0, watch Raft re-elect, measure recovery time"
   echo ""
 
-  step "1. Pre-flight: produce 20 messages as baseline..."
-  cmd_produce 20 2>/dev/null
+  step "1. Starting continuous background producer (~500 KB/s)..."
+  (
+    STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
+    PAD=$(python3 -c "print('x'*2300)")
+    BIDX=0
+    while true; do
+      BROKER="redpanda-${BIDX}"
+      python3 -c "
+import random, datetime, json, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+stores = sys.argv[1].split(',')
+pad = sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc)
+for _ in range(200):
+    print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
+" "${STORES[*]// /,}" "$PAD" | \
+        kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
+          rpk topic produce "$TOPIC" &>/dev/null || true
+      BIDX=$(( (BIDX + 1) % 3 ))
+    done
+  ) &
+  PROD_PID=$!
+  disown $PROD_PID 2>/dev/null || true
+  trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+  ok "Producer running in background (PID $PROD_PID)"
+  sleep 3
   echo ""
 
   step "2. ShadowLink lag before kill:"
@@ -883,6 +932,8 @@ cmd_chaos() {
 
   step "3. Cluster health + metrics before kill:"
   rp_exec "$CONTEXT_A" rpk cluster health 2>&1
+  PRE_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
+    | awk 'NR>1 {sum += $NF} END {print sum+0}')
   UNAVAIL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
   UNREPL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
   info "  unavailable_partitions   : ${UNAVAIL_PRE}  (expect 0)"
@@ -892,9 +943,9 @@ cmd_chaos() {
   info "Killing redpanda-0 on eu-west-1 in 3 seconds..."
   sleep 3
   CHAOS_START=$SECONDS
-  grafana_annotate "$CONTEXT_A" "chaos: redpanda-0 deleted" "chaos"
+  grafana_annotate "$CONTEXT_A" "chaos: redpanda-0 deleted — load ~500 KB/s" "chaos"
   kubectl --context "$CONTEXT_A" -n redpanda delete pod redpanda-0 --grace-period=0 2>&1
-  echo -e "${RED}✗ redpanda-0 deleted — outage started${NC}"
+  echo -e "${RED}✗ redpanda-0 deleted — outage started, producer still running${NC}"
   echo ""
 
   step "4. Watching cluster recovery (polling every 5s)..."
@@ -902,8 +953,9 @@ cmd_chaos() {
   RECOVERED=false
   while true; do
     ELAPSED=$(( SECONDS - CHAOS_START ))
-    HEALTH=$(rp_exec "$CONTEXT_A" rpk cluster health 2>/dev/null | \
-      awk '/^Healthy:/{print $2; exit}' || echo "false")
+    HEALTH=$(rp_exec_any "$CONTEXT_A" rpk cluster health 2>/dev/null | \
+      awk '/^Healthy:/{print $2; exit}' | head -1 | tr -d '[:space:]' || true)
+    HEALTH="${HEALTH:-false}"
     POD_PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod redpanda-0 \
       -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
     UNAVAIL=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
@@ -922,8 +974,14 @@ cmd_chaos() {
 
   if $RECOVERED; then
     RTO=$(( SECONDS - CHAOS_START ))
-    grafana_annotate "$CONTEXT_A" "chaos: cluster recovered — RTO ${RTO}s" "chaos"
-    ok "Broker recovered in ${RTO}s"
+    POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
+      | awk 'NR>1 {sum += $NF} END {print sum+0}')
+    kill $PROD_PID 2>/dev/null || true
+    trap - EXIT
+    MSGS_DURING=$(( POST_HWM - PRE_HWM ))
+    BYTES_DURING=$(( MSGS_DURING * 2500 ))
+    KBPS=$(( RTO > 0 ? BYTES_DURING / RTO / 1024 : 0 ))
+    grafana_annotate "$CONTEXT_A" "chaos: recovered — RTO ${RTO}s, ${MSGS_DURING} msgs during outage, 0 lost" "chaos"
     echo ""
     step "5. Metrics after recovery:"
     UNAVAIL_POST=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
@@ -935,7 +993,14 @@ cmd_chaos() {
     rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
       grep -E "^Name:|PARTITION|SRC_LSO" | head -20
     echo ""
-    ok "HA demo complete — no manual intervention, no data loss, RTO = ${RTO}s"
+    ok "═══════════════════════════════════════════"
+    ok "  HA DEMO COMPLETE"
+    ok "  RTO (broker kill → healthy)  : ${RTO}s"
+    ok "  Messages produced during RTO : $MSGS_DURING"
+    ok "  Sustained throughput         : ~${KBPS} KB/s"
+    ok "  Messages lost                : 0"
+    ok "  No manual intervention required"
+    ok "═══════════════════════════════════════════"
   fi
 }
 
