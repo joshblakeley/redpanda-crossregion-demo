@@ -4,6 +4,7 @@ set -euo pipefail
 
 CONTEXT_A="rp-demo-eu-west-1"
 CONTEXT_B="rp-demo-eu-central-1"
+CONTEXT_C="rp-demo-europe-west4"
 TOPIC="retail-orders"
 GROUP="retail-pos-system"
 
@@ -72,7 +73,9 @@ usage() {
   echo "  produce [n]            Produce n order events to eu-west-1 (default: 10)"
   echo "  consume-source         Consume retail-orders from eu-west-1"
   echo "  consume-shadow         Consume retail-orders from eu-central-1"
-  echo "  consume-both           Both clusters side by side"
+  echo "  consume-gcp            Consume retail-orders from europe-west4 (GCP)"
+  echo "  consume-both           Both clusters side by side (eu-west-1 + eu-central-1)"
+  echo "  consume-all            All three clusters side by side"
   echo "  status                 ShadowLink status and topic offsets"
   echo "  full-demo              Full end-to-end scripted demo"
   echo ""
@@ -137,6 +140,8 @@ cmd_preflight() {
     kubectl --context "$CONTEXT_A" cluster-info
   _chk "context $CONTEXT_B reachable" \
     kubectl --context "$CONTEXT_B" cluster-info
+  _chk "context $CONTEXT_C reachable" \
+    kubectl --context "$CONTEXT_C" cluster-info
   echo ""
 
   # ── Redpanda pods ────────────────────────────────────────────────────────
@@ -147,10 +152,12 @@ cmd_preflight() {
   }
   step "Redpanda brokers:"
   for broker in 0 1 2; do
-    _chk "eu-west-1    redpanda-$broker Running" \
+    _chk "eu-west-1      redpanda-$broker Running" \
       _pod_running "$CONTEXT_A" "redpanda-$broker"
-    _chk "eu-central-1 redpanda-$broker Running" \
+    _chk "eu-central-1   redpanda-$broker Running" \
       _pod_running "$CONTEXT_B" "redpanda-$broker"
+    _chk "europe-west4   redpanda-$broker Running" \
+      _pod_running "$CONTEXT_C" "redpanda-$broker"
   done
   echo ""
 
@@ -180,6 +187,9 @@ cmd_preflight() {
   _chk "eu-central-1 AMQP consumer Running" \
     kubectl --context "$CONTEXT_B" -n redpanda get pod -l app=amqp-iot-consumer \
       --field-selector=status.phase=Running --no-headers
+  _chk "europe-west4 Console Running" \
+    kubectl --context "$CONTEXT_C" -n redpanda get pod -l app.kubernetes.io/name=console \
+      --field-selector=status.phase=Running --no-headers
   echo ""
 
   # ── ShadowLink ───────────────────────────────────────────────────────────
@@ -187,10 +197,19 @@ cmd_preflight() {
   SL_STATE=$(kubectl --context "$CONTEXT_B" -n redpanda get shadowlink "$SHADOW_LINK" \
     -o jsonpath='{.status.state}' 2>/dev/null || echo "not found")
   if [[ "$SL_STATE" == "active" ]]; then
-    ok "ShadowLink '$SHADOW_LINK' is active"
+    ok "ShadowLink '$SHADOW_LINK' is active (eu-central-1)"
     (( PASS++ )) || true
   else
-    echo -e "${RED}✗ ShadowLink '$SHADOW_LINK' state: $SL_STATE${NC}"
+    echo -e "${RED}✗ ShadowLink '$SHADOW_LINK' state: $SL_STATE (eu-central-1)${NC}"
+    (( FAIL++ )) || true
+  fi
+  SL_STATE_C=$(kubectl --context "$CONTEXT_C" -n redpanda get shadowlink "$SHADOW_LINK" \
+    -o jsonpath='{.status.state}' 2>/dev/null || echo "not found")
+  if [[ "$SL_STATE_C" == "active" ]]; then
+    ok "ShadowLink '$SHADOW_LINK' is active (europe-west4)"
+    (( PASS++ )) || true
+  else
+    echo -e "${RED}✗ ShadowLink '$SHADOW_LINK' state: $SL_STATE_C (europe-west4)${NC}"
     (( FAIL++ )) || true
   fi
   echo ""
@@ -202,6 +221,8 @@ cmd_preflight() {
       rp_exec "$CONTEXT_A" rpk topic describe "$t"
     _chk "eu-central-1 topic '$t' shadow exists" \
       rp_exec "$CONTEXT_B" rpk topic describe "$t"
+    _chk "europe-west4 topic '$t' shadow exists" \
+      rp_exec "$CONTEXT_C" rpk topic describe "$t"
   done
   echo ""
 
@@ -211,23 +232,33 @@ cmd_preflight() {
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   CONSOLE_B=$(kubectl --context "$CONTEXT_B" -n redpanda get svc console \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  CONSOLE_C=$(kubectl --context "$CONTEXT_C" -n redpanda get svc console \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   GRAFANA_A=$(kubectl --context "$CONTEXT_A" -n monitoring get svc kube-prometheus-stack-grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   GRAFANA_B=$(kubectl --context "$CONTEXT_B" -n monitoring get svc kube-prometheus-stack-grafana \
+    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  GRAFANA_C=$(kubectl --context "$CONTEXT_C" -n monitoring get svc kube-prometheus-stack-grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
   GRAFANA_PASS_A=$(kubectl --context "$CONTEXT_A" -n monitoring get secret kube-prometheus-stack-grafana \
     -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
   GRAFANA_PASS_B=$(kubectl --context "$CONTEXT_B" -n monitoring get secret kube-prometheus-stack-grafana \
     -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
+  GRAFANA_PASS_C=$(kubectl --context "$CONTEXT_C" -n monitoring get secret kube-prometheus-stack-grafana \
+    -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || echo "prom-operator")
 
-  [[ -n "$CONSOLE_A" ]] && info "  Console eu-west-1   : http://$CONSOLE_A:8080" \
-    || echo -e "  ${RED}Console eu-west-1   : LoadBalancer not ready${NC}"
-  [[ -n "$CONSOLE_B" ]] && info "  Console eu-central-1: http://$CONSOLE_B:8080" \
-    || echo -e "  ${RED}Console eu-central-1: LoadBalancer not ready${NC}"
-  [[ -n "$GRAFANA_A" ]] && info "  Grafana eu-west-1   : http://$GRAFANA_A  (admin / ${GRAFANA_PASS_A})" \
-    || echo -e "  ${RED}Grafana eu-west-1   : LoadBalancer not ready${NC}"
-  [[ -n "$GRAFANA_B" ]] && info "  Grafana eu-central-1: http://$GRAFANA_B  (admin / ${GRAFANA_PASS_B})" \
-    || echo -e "  ${RED}Grafana eu-central-1: LoadBalancer not ready${NC}"
+  [[ -n "$CONSOLE_A" ]] && info "  Console eu-west-1    : http://$CONSOLE_A:8080" \
+    || echo -e "  ${RED}Console eu-west-1    : LoadBalancer not ready${NC}"
+  [[ -n "$CONSOLE_B" ]] && info "  Console eu-central-1 : http://$CONSOLE_B:8080" \
+    || echo -e "  ${RED}Console eu-central-1 : LoadBalancer not ready${NC}"
+  [[ -n "$CONSOLE_C" ]] && info "  Console europe-west4 : http://$CONSOLE_C:8080" \
+    || echo -e "  ${RED}Console europe-west4 : LoadBalancer not ready${NC}"
+  [[ -n "$GRAFANA_A" ]] && info "  Grafana eu-west-1    : http://$GRAFANA_A  (admin / ${GRAFANA_PASS_A})" \
+    || echo -e "  ${RED}Grafana eu-west-1    : LoadBalancer not ready${NC}"
+  [[ -n "$GRAFANA_B" ]] && info "  Grafana eu-central-1 : http://$GRAFANA_B  (admin / ${GRAFANA_PASS_B})" \
+    || echo -e "  ${RED}Grafana eu-central-1 : LoadBalancer not ready${NC}"
+  [[ -n "$GRAFANA_C" ]] && info "  Grafana europe-west4 : http://$GRAFANA_C  (admin / ${GRAFANA_PASS_C})" \
+    || echo -e "  ${RED}Grafana europe-west4 : LoadBalancer not ready${NC}"
   echo ""
 
   # ── Summary ──────────────────────────────────────────────────────────────
@@ -269,7 +300,7 @@ cmd_produce() {
   done
 
   echo ""
-  info "Produced $n messages. ShadowLink will sync to eu-central-1 within 30s."
+  info "Produced $n messages. ShadowLink will sync to eu-central-1 (AWS) and europe-west4 (GCP) within 30s."
 }
 
 cmd_consume_source() {
@@ -321,6 +352,47 @@ cmd_consume_both() {
   wait
 }
 
+cmd_consume_gcp() {
+  banner "Consuming retail-orders from europe-west4 (GCP)"
+  step "Cluster        : $CONTEXT_C"
+  step "Topic          : $TOPIC"
+  info "Showing last 5 messages"
+  echo ""
+
+  kubectl --context "$CONTEXT_C" -n redpanda exec -it redpanda-0 -c redpanda -- \
+    rpk topic consume "$TOPIC" \
+    --offset end \
+    -n 5 \
+    --format '%v\n'
+}
+
+cmd_consume_all() {
+  banner "Consuming from ALL THREE clusters (split terminal view)"
+  info "Starting consumers on all three clusters. Kill with Ctrl+C."
+  echo ""
+
+  kubectl --context "$CONTEXT_A" -n redpanda exec -it redpanda-0 -c redpanda -- \
+    rpk topic consume "$TOPIC" \
+    --group "$GROUP-source" \
+    --format "[eu-west-1]      %v\n" &
+  PID_A=$!
+
+  kubectl --context "$CONTEXT_B" -n redpanda exec -it redpanda-0 -c redpanda -- \
+    rpk topic consume "$TOPIC" \
+    --group "$GROUP-shadow" \
+    --format "[eu-central-1]   %v\n" &
+  PID_B=$!
+
+  kubectl --context "$CONTEXT_C" -n redpanda exec -it redpanda-0 -c redpanda -- \
+    rpk topic consume "$TOPIC" \
+    --group "$GROUP-gcp" \
+    --format "[europe-west4]   %v\n" &
+  PID_C=$!
+
+  trap "kill $PID_A $PID_B $PID_C 2>/dev/null; exit 0" INT TERM
+  wait
+}
+
 cmd_status() {
   banner "ShadowLink Status"
 
@@ -345,12 +417,27 @@ cmd_status() {
   rp_exec "$CONTEXT_B" rpk topic describe "$TOPIC" -p 2>&1 || true
   echo ""
 
+  step "Topic offsets — europe-west4 (shadow, GCP):"
+  rp_exec "$CONTEXT_C" rpk topic describe "$TOPIC" -p 2>&1 || true
+  echo ""
+
+  step "ShadowLink status (europe-west4):"
+  kubectl --context "$CONTEXT_C" -n redpanda get shadowlink "$SHADOW_LINK" \
+    -o custom-columns=\
+'NAME:.metadata.name,STATE:.status.state,SYNCED:.status.conditions[0].status,MESSAGE:.status.conditions[0].message' \
+    2>&1 || true
+  echo ""
+
   step "Consumer group offsets — eu-west-1 (source):"
   rp_exec "$CONTEXT_A" rpk group describe "$GROUP" 2>&1 || true
   echo ""
 
   step "Consumer group offsets — eu-central-1 (shadow — synced by ShadowLink):"
   rp_exec "$CONTEXT_B" rpk group describe "$GROUP" 2>&1 || true
+  echo ""
+
+  step "Consumer group offsets — europe-west4 (shadow — synced by ShadowLink):"
+  rp_exec "$CONTEXT_C" rpk group describe "$GROUP" 2>&1 || true
 }
 
 cmd_full_demo() {
@@ -1124,7 +1211,9 @@ case "${1:-}" in
   produce)        cmd_produce "${2:-10}" ;;
   consume-source) cmd_consume_source ;;
   consume-shadow) cmd_consume_shadow ;;
+  consume-gcp)    cmd_consume_gcp ;;
   consume-both)   cmd_consume_both ;;
+  consume-all)    cmd_consume_all ;;
   status)         cmd_status ;;
   full-demo)      cmd_full_demo ;;
   mqtt-publish)   cmd_mqtt_publish "${2:-10}" ;;

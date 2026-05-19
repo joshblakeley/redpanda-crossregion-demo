@@ -1,0 +1,34 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: ShadowLink
+metadata:
+  name: eu-west-1-shadow
+  namespace: redpanda
+spec:
+  shadowCluster:
+    clusterRef:
+      name: redpanda
+  sourceCluster:
+    staticConfiguration:
+      kafka:
+        brokers:
+          - ab14f1341b5a04455951a4c439736dab-638340892.eu-west-1.elb.amazonaws.com:31092
+          - ac89516824be94ebd9a1cd2b16ed6b92-1451718857.eu-west-1.elb.amazonaws.com:31092
+          - aa2598d94380b48f6b6c4619e7a40926-1282810100.eu-west-1.elb.amazonaws.com:31092
+        tls:
+          caCert:
+            secretKeyRef:
+              name: eu-west-1-ca-cert
+              key: ca.crt
+  topicMetadataSyncOptions:
+    interval: 30s
+    autoCreateShadowTopicFilters:
+      - name: "regional-"
+        filterType: exclude
+        patternType: prefixed
+      - name: "*"
+        filterType: include
+        patternType: literal
+  consumerOffsetSyncOptions:
+    interval: 30s
+  schemaRegistrySyncOptions:
+    schema_registry_shadowing_mode: topic

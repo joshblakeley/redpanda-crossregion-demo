@@ -1,35 +1,34 @@
 # Redpanda Cross-Region Demo
 
-Two-region Redpanda deployment demonstrating cross-region replication, protocol bridging, data residency enforcement, HA, and DR.
+Three-region, multi-cloud Redpanda deployment demonstrating cross-region replication, protocol bridging, data residency enforcement, HA, and DR.
 
 ---
 
 ## Architecture
 
 ```
-eu-west-1 (primary)                               eu-central-1 (DR / shadow)
-┌──────────────────────────────────┐              ┌──────────────────────────────────┐
-│  Mosquitto MQTT broker           │              │                                  │
-│      │                           │              │  Redpanda Connect                │
-│  Redpanda Connect                │              │  (Kafka → AMQP 0.9.1 bridge)     │
-│  (MQTT → Kafka bridge)           │              │      │                           │
-│      │                           │              │  RabbitMQ                        │
-│  Redpanda 3-node cluster         │──ShadowLink─▶│  Redpanda 3-node cluster         │
-│  retail-orders, iot-events       │  (regional-* │  (shadow topics, read-only)      │
-│                                  │   excluded,  │      │                           │
-│                                  │   * included)│  Python pika AMQP consumer       │
-│  Python confluent-kafka consumer │              │  Redpanda Console                │
-│  Redpanda Console                │              │  Prometheus + Grafana            │
-│  Prometheus + Grafana            │              └──────────────────────────────────┘
-└──────────────────────────────────┘
+eu-west-1 (AWS, primary)            eu-central-1 (AWS, DR)        europe-west4 (GCP, shadow)
+┌──────────────────────────┐        ┌──────────────────────────┐  ┌──────────────────────────┐
+│  Mosquitto MQTT broker   │        │  Redpanda Connect        │  │                          │
+│      │                   │        │  (Kafka → AMQP bridge)   │  │                          │
+│  Redpanda Connect        │        │      │                   │  │                          │
+│  (MQTT → Kafka bridge)   │        │  RabbitMQ                │  │                          │
+│      │                   │─ShadowLink──▶│                   │  │                          │
+│  Redpanda [3 nodes]      │        │  Redpanda [3 nodes]      │  │  Redpanda [3 nodes]      │
+│  retail-orders           │─ShadowLink────────────────────────────▶(shadow topics,          │
+│  iot-events              │        │  (shadow, read-only)     │  │   read-only)             │
+│                          │        │  Python AMQP consumer    │  │                          │
+│  Python Kafka consumer   │        │  Console · Grafana       │  │  Console · Grafana       │
+│  Console · Grafana       │        └──────────────────────────┘  └──────────────────────────┘
+└──────────────────────────┘
 
-ShadowLink filter policy (clusters/region-b/shadowlink.yaml):
-  regional-* prefix → EXCLUDED (stays in origin region only)
-  everything else → INCLUDED (replicates to DR cluster)
+ShadowLink filter policy (identical on both destination clusters):
+  regional-* prefix → EXCLUDED (stays in eu-west-1 only)
+  everything else   → INCLUDED (replicates to both DR clusters)
 ```
 
-**EKS clusters**: `rp-demo-eu-west-1` (primary), `rp-demo-eu-central-1` (DR)  
-**Instance type**: m7gd.large (Graviton3, local NVMe via LVM CSI)  
+**AWS clusters**: `rp-demo-eu-west-1` (primary, EKS m7gd.large Graviton3), `rp-demo-eu-central-1` (DR, EKS)  
+**GCP cluster**: `rp-demo-europe-west4` (shadow, GKE n2-standard-4, PD SSD)  
 **Redpanda Operator**: v26.1.3
 
 ---
@@ -45,6 +44,7 @@ Checks all pods, ShadowLink state, topics, and prints Console + Grafana URLs. Fi
 **Open in browser:**
 - Console eu-west-1 (`:8080`)
 - Console eu-central-1 (`:8080`)
+- Console europe-west4 (`:8080`)
 - Grafana eu-west-1 — Redpanda Overview dashboard
 
 ---
@@ -53,7 +53,9 @@ Checks all pods, ShadowLink state, topics, and prints Console + Grafana URLs. Fi
 
 ### Segment 0 — Context (5 min)
 
-- Operator and broker run identically on GCP GKE, Azure AKS, on-prem Kubernetes, AliCloud ACK — demo uses AWS EKS
+- This demo runs three clusters across two clouds: AWS EKS (eu-west-1, eu-central-1) and GCP GKE (europe-west4)
+- Identical Operator version, identical CR YAML structure, identical ShadowLink filter on all three
+- Also runs on Azure AKS, on-prem Kubernetes, AliCloud ACK — same manifests
 - Notable GA features since v23: built-in Schema Registry, Tiered Storage, Operator-driven scale-down
 
 ---
@@ -62,7 +64,24 @@ Checks all pods, ShadowLink state, topics, and prints Console + Grafana URLs. Fi
 
 Slide only. Cover:
 - Current estate being replaced and target state
-- Key requirements: zero message loss on failover, low ops overhead, incremental migration path
+- Key requirements: zero message loss on failover, low ops overhead, incremental migration path, no cloud lock-in
+
+---
+
+### Segment 1b — Cloud Portability (3 min)
+
+```bash
+./demo.sh preflight
+./demo.sh produce 20
+./demo.sh consume-all
+```
+
+**What to show:**
+- `preflight` shows all three contexts green — eu-west-1 (AWS), eu-central-1 (AWS), europe-west4 (GCP)
+- `consume-all` shows the same messages arriving on all three clusters within 30s
+- GCP cluster runs identical Operator/CR config — only difference is `storageClass: premium-rwo`
+- ShadowLink filter YAML is byte-for-byte identical on both destination clusters
+- Any cluster can be promoted to primary with a single `rpk shadow failover` command
 
 ---
 
@@ -94,12 +113,12 @@ Select a reference customer matching the prospect's profile: global enterprise, 
 
 ```bash
 ./demo.sh produce 20
-./demo.sh consume-both
+./demo.sh consume-all
 ./demo.sh status
 ```
 
 **What to show:**
-- Messages produced to eu-west-1 appear on eu-central-1 within the sync interval (30s)
+- Messages produced to eu-west-1 appear on eu-central-1 (AWS) and europe-west4 (GCP) within 30s
 - Consumer group offsets replicate cross-region — failover resumes from exact last offset, no replay
 - Schema registry sync: consumer contracts stay intact across a regional failure
 
@@ -196,13 +215,15 @@ kubectl --context rp-demo-eu-central-1 -n redpanda get shadowlink eu-west-1-shad
 
 | Command | Segment | Description |
 |---|---|---|
-| `preflight` | Before | Health check — verify all pods, ShadowLink, URLs |
+| `preflight` | Before | Health check — all three clusters, ShadowLink, URLs |
 | `upgrade` | 3 | Rolling cluster restart with live producer — zero message loss |
-| `produce [n]` | 4 | Produce n order events to eu-west-1 (default: 10) |
+| `produce [n]` | 1b/4 | Produce n order events to eu-west-1 (default: 10) |
 | `consume-source` | 4 | Consume `retail-orders` from eu-west-1 |
 | `consume-shadow` | 4 | Consume `retail-orders` from eu-central-1 |
-| `consume-both` | 4 | Both clusters side by side |
-| `status` | 4 | ShadowLink status, topic offsets, consumer group sync |
+| `consume-gcp` | 1b | Consume `retail-orders` from europe-west4 (GCP) |
+| `consume-both` | 4 | eu-west-1 + eu-central-1 side by side |
+| `consume-all` | 1b/4 | All three clusters side by side |
+| `status` | 4 | ShadowLink status, topic offsets, consumer group sync (all three) |
 | `mqtt-publish [n]` | 5 | Publish n MQTT events via Mosquitto (default: 10) |
 | `mqtt-consume [source\|shadow]` | 5 | Consume `iot-events` as a Kafka client |
 | `mqtt-status` | 5 | MQTT bridge pipeline status |
@@ -240,7 +261,7 @@ cd demo/
 ./setup.sh
 ```
 
-Provisions both EKS clusters, installs cert-manager + LVM CSI + kube-prometheus-stack, deploys Redpanda Operator, 3-node clusters, ShadowLink, MQTT bridge, AMQP bridge, and creates topics. ~25–35 minutes.
+Provisions two EKS clusters and one GKE cluster, installs cert-manager + LVM CSI (EKS only) + kube-prometheus-stack, deploys Redpanda Operator, 3-node clusters, ShadowLink on both DR clusters, MQTT bridge, AMQP bridge, and creates topics. ~30–40 minutes.
 
 ---
 
@@ -255,21 +276,25 @@ demo/
 │   ├── cluster-eu-west-1.yaml
 │   └── cluster-eu-central-1.yaml
 ├── clusters/
-│   ├── region-a/                    # eu-west-1 manifests
+│   ├── region-a/                    # eu-west-1 (AWS EKS) manifests
 │   │   ├── redpanda.yaml            # 3-node cluster, TLS, external LB
 │   │   ├── console.yaml
 │   │   ├── python-consumer.yaml
 │   │   └── mqtt-bridge/
 │   │       ├── mosquitto.yaml
 │   │       └── connect.yaml         # MQTT → iot-events
-│   └── region-b/                    # eu-central-1 manifests
-│       ├── redpanda.yaml            # 3-node cluster, TLS
+│   ├── region-b/                    # eu-central-1 (AWS EKS) manifests
+│   │   ├── redpanda.yaml            # 3-node cluster, TLS
+│   │   ├── console.yaml
+│   │   ├── shadowlink.yaml          # regional- excluded, * included
+│   │   └── amqp-bridge/
+│   │       ├── rabbitmq.yaml
+│   │       ├── connect.yaml         # iot-events → AMQP
+│   │       └── amqp-consumer.yaml
+│   └── region-c/                    # europe-west4 (GCP GKE) manifests
+│       ├── redpanda.yaml            # 3-node cluster, premium-rwo storage
 │       ├── console.yaml
-│       ├── shadowlink.yaml          # regional- excluded, * included
-│       └── amqp-bridge/
-│           ├── rabbitmq.yaml
-│           ├── connect.yaml         # iot-events → AMQP
-│           └── amqp-consumer.yaml
+│       └── shadowlink.yaml          # regional- excluded, * included (identical filter to region-b)
 └── consumers/
     └── python/
         ├── retail_consumer.py

@@ -4,6 +4,7 @@ set -euo pipefail
 OPERATOR_VERSION="v26.1.3"
 CONTEXT_A="rp-demo-eu-west-1"
 CONTEXT_B="rp-demo-eu-central-1"
+CONTEXT_C="rp-demo-europe-west4"
 
 # ---------------------------------------------------------------------------
 # 1. Provision EKS clusters
@@ -24,12 +25,30 @@ kubectl config rename-context \
   "$CONTEXT_B"
 
 # ---------------------------------------------------------------------------
+# 1b. Provision GKE cluster in europe-west4
+# ---------------------------------------------------------------------------
+echo "==> Creating GKE cluster rp-demo-europe-west4 in europe-west4..."
+gcloud container clusters create rp-demo-europe-west4 \
+  --region europe-west4 \
+  --machine-type n2-standard-4 \
+  --num-nodes 3 \
+  --node-labels role=redpanda \
+  --node-pool-name redpanda \
+  --workload-pool "$(gcloud config get-value project).svc.id.goog"
+
+gcloud container clusters get-credentials rp-demo-europe-west4 --region europe-west4
+
+kubectl config rename-context \
+  "$(kubectl config get-contexts -o name | grep europe-west4)" \
+  "$CONTEXT_C"
+
+# ---------------------------------------------------------------------------
 # 2. Install cert-manager (required by Redpanda Operator)
 # ---------------------------------------------------------------------------
 helm repo add jetstack https://charts.jetstack.io
 helm repo update
 
-for CTX in "$CONTEXT_A" "$CONTEXT_B"; do
+for CTX in "$CONTEXT_A" "$CONTEXT_B" "$CONTEXT_C"; do
   echo "==> Installing cert-manager on $CTX..."
   helm upgrade --install cert-manager jetstack/cert-manager \
     --kube-context "$CTX" \
@@ -41,6 +60,8 @@ done
 
 # ---------------------------------------------------------------------------
 # 3. Install LVM CSI driver for local NVMe storage (m7gd.large: /dev/nvme1n1)
+# NOTE: CONTEXT_C (GKE/europe-west4) is intentionally excluded — GCP provides
+#       the premium-rwo (PD SSD) StorageClass natively; no LVM CSI needed.
 # ---------------------------------------------------------------------------
 helm repo add metal-stack https://helm.metal-stack.io
 helm repo update
@@ -76,7 +97,7 @@ done
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 
-for CTX in "$CONTEXT_A" "$CONTEXT_B"; do
+for CTX in "$CONTEXT_A" "$CONTEXT_B" "$CONTEXT_C"; do
   echo "==> Installing kube-prometheus-stack on $CTX..."
   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
     --kube-context "$CTX" \
@@ -93,7 +114,7 @@ done
 helm repo add redpanda https://charts.redpanda.com
 helm repo update
 
-for CTX in "$CONTEXT_A" "$CONTEXT_B"; do
+for CTX in "$CONTEXT_A" "$CONTEXT_B" "$CONTEXT_C"; do
   echo "==> Installing Redpanda Operator on $CTX..."
   helm upgrade --install redpanda-controller redpanda/operator \
     --kube-context "$CTX" \
@@ -115,10 +136,14 @@ echo "==> Deploying Redpanda cluster on $CONTEXT_B (eu-central-1)..."
 kubectl --context "$CONTEXT_B" apply -f clusters/region-b/redpanda.yaml
 kubectl --context "$CONTEXT_B" apply -f clusters/region-b/console.yaml
 
+echo "==> Deploying Redpanda cluster on $CONTEXT_C (europe-west4)..."
+kubectl --context "$CONTEXT_C" apply -f clusters/region-c/redpanda.yaml
+kubectl --context "$CONTEXT_C" apply -f clusters/region-c/console.yaml
+
 # ---------------------------------------------------------------------------
 # 7. Wait for clusters to be ready
 # ---------------------------------------------------------------------------
-for CTX in "$CONTEXT_A" "$CONTEXT_B"; do
+for CTX in "$CONTEXT_A" "$CONTEXT_B" "$CONTEXT_C"; do
   echo "==> Waiting for Redpanda cluster to be ready on $CTX (up to 10m)..."
   SECONDS=0
   until kubectl --context "$CTX" -n redpanda get redpanda redpanda \
@@ -133,12 +158,14 @@ for CTX in "$CONTEXT_A" "$CONTEXT_B"; do
 done
 
 # ---------------------------------------------------------------------------
-# 8. Enable shadow linking on both clusters
+# 8. Enable shadow linking on all clusters
 # ---------------------------------------------------------------------------
-echo "==> Enabling shadow_linking feature on both clusters..."
+echo "==> Enabling shadow_linking feature on all clusters..."
 kubectl --context "$CONTEXT_A" -n redpanda exec redpanda-0 -- \
   rpk cluster config set enable_shadow_linking true
 kubectl --context "$CONTEXT_B" -n redpanda exec redpanda-0 -- \
+  rpk cluster config set enable_shadow_linking true
+kubectl --context "$CONTEXT_C" -n redpanda exec redpanda-0 -- \
   rpk cluster config set enable_shadow_linking true
 
 # ---------------------------------------------------------------------------
@@ -182,6 +209,46 @@ done
 echo "  ShadowLink active - eu-west-1 topics will sync to eu-central-1 every 30s"
 
 # ---------------------------------------------------------------------------
+# 9b. Copy eu-west-1 external CA cert to europe-west4, then deploy ShadowLink
+# ---------------------------------------------------------------------------
+echo "==> Copying eu-west-1 external CA cert to europe-west4..."
+kubectl --context "$CONTEXT_A" -n redpanda get secret redpanda-external-root-certificate \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/eu-west-1-ca.crt
+
+kubectl --context "$CONTEXT_C" -n redpanda create secret generic eu-west-1-ca-cert \
+  --from-file=ca.crt=/tmp/eu-west-1-ca.crt \
+  --dry-run=client -o yaml | kubectl --context "$CONTEXT_C" apply -f -
+
+rm /tmp/eu-west-1-ca.crt
+
+echo "==> Deploying ShadowLink on $CONTEXT_C (europe-west4)..."
+# Replace broker addresses with live LB hostnames from eu-west-1
+BROKER_0=$(kubectl --context "$CONTEXT_A" -n redpanda get svc lb-redpanda-0 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+BROKER_1=$(kubectl --context "$CONTEXT_A" -n redpanda get svc lb-redpanda-1 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+BROKER_2=$(kubectl --context "$CONTEXT_A" -n redpanda get svc lb-redpanda-2 \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+cat clusters/region-c/shadowlink.yaml \
+  | sed "s|ab14f1341b5a04455951a4c439736dab-638340892.eu-west-1.elb.amazonaws.com|$BROKER_0|g" \
+  | sed "s|ac89516824be94ebd9a1cd2b16ed6b92-1451718857.eu-west-1.elb.amazonaws.com|$BROKER_1|g" \
+  | sed "s|aa2598d94380b48f6b6c4619e7a40926-1282810100.eu-west-1.elb.amazonaws.com|$BROKER_2|g" \
+  | kubectl --context "$CONTEXT_C" apply -f -
+
+echo "==> Waiting for ShadowLink to become active on $CONTEXT_C (up to 3m)..."
+SECONDS=0
+until kubectl --context "$CONTEXT_C" -n redpanda get shadowlink eu-west-1-shadow \
+    -o jsonpath='{.status.state}' 2>/dev/null | grep -q "active"; do
+  if (( SECONDS > 180 )); then
+    echo "WARNING: ShadowLink not yet active - check 'kubectl --context $CONTEXT_C -n redpanda get shadowlink eu-west-1-shadow'"
+    break
+  fi
+  sleep 5
+done
+echo "  ShadowLink active - eu-west-1 topics will sync to europe-west4 every 30s"
+
+# ---------------------------------------------------------------------------
 # 10. Deploy MQTT bridge (eu-west-1) and AMQP bridge + consumers (eu-central-1)
 # ---------------------------------------------------------------------------
 echo "==> Deploying MQTT bridge on $CONTEXT_A (eu-west-1)..."
@@ -201,20 +268,24 @@ kubectl --context "$CONTEXT_A" -n redpanda exec redpanda-0 -c redpanda -- \
   rpk topic create retail-orders iot-events --partitions 3 2>/dev/null || true
 
 echo ""
-echo "==> Done. Both clusters are up."
+echo "==> Done. All three clusters are up."
 echo ""
 echo "Contexts:"
-echo "  eu-west-1   : kubectl --context $CONTEXT_A ..."
-echo "  eu-central-1: kubectl --context $CONTEXT_B ..."
+echo "  eu-west-1    (EKS): kubectl --context $CONTEXT_A ..."
+echo "  eu-central-1 (EKS): kubectl --context $CONTEXT_B ..."
+echo "  europe-west4 (GKE): kubectl --context $CONTEXT_C ..."
 echo ""
 echo "Smoke test:"
 echo "  kubectl --context $CONTEXT_A -n redpanda exec -it redpanda-0 -- rpk cluster info"
 echo "  kubectl --context $CONTEXT_B -n redpanda exec -it redpanda-0 -- rpk cluster info"
+echo "  kubectl --context $CONTEXT_C -n redpanda exec -it redpanda-0 -- rpk cluster info"
 echo ""
 echo "Console URLs (once LoadBalancer IPs are assigned):"
 echo "  kubectl --context $CONTEXT_A -n redpanda get svc console"
 echo "  kubectl --context $CONTEXT_B -n redpanda get svc console"
+echo "  kubectl --context $CONTEXT_C -n redpanda get svc console"
 echo ""
 echo "Grafana URLs (admin / prom-operator):"
 echo "  kubectl --context $CONTEXT_A -n monitoring get svc kube-prometheus-stack-grafana"
 echo "  kubectl --context $CONTEXT_B -n monitoring get svc kube-prometheus-stack-grafana"
+echo "  kubectl --context $CONTEXT_C -n monitoring get svc kube-prometheus-stack-grafana"
