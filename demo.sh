@@ -16,6 +16,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 SHADOW_LINK="eu-west-1-shadow"
+LOAD_PID_FILE="/tmp/rp-demo-load.pid"
 
 banner() { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════════${NC}"; echo -e "${BOLD}${BLUE}  $1${NC}"; echo -e "${BOLD}${BLUE}══════════════════════════════════════════════${NC}\n"; }
 step()   { echo -e "${CYAN}▶ $1${NC}"; }
@@ -72,6 +73,9 @@ usage() {
   echo "Commands:"
   echo "  preflight              Pre-meeting health check — verify all pods, links, and URLs"
   echo ""
+  echo "  load                   Start persistent ~500 KB/s background producer (run once, leave running)"
+  echo "  stop-load              Stop the background producer"
+  echo ""
   echo "  produce [n]            Produce n order events to eu-west-1 (default: 10)"
   echo "  consume-source         Consume retail-orders from eu-west-1"
   echo "  consume-shadow         Consume retail-orders from eu-central-1"
@@ -113,6 +117,66 @@ rp_exec_any() {
     fi
   done
   return 1
+}
+
+# ── Load generator ────────────────────────────────────────────────────────────
+
+_load_running() {
+  [[ -f "$LOAD_PID_FILE" ]] && kill -0 "$(cat "$LOAD_PID_FILE")" 2>/dev/null
+}
+
+_start_producer_bg() {
+  # Starts the background producer subshell, echos its PID.
+  # Round-robins across all three brokers so one restarting doesn't stall throughput.
+  (
+    STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
+    PAD=$(python3 -c "print('x'*2300)")
+    BIDX=0
+    while true; do
+      BROKER="redpanda-${BIDX}"
+      python3 -c "
+import random, datetime, json, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+stores = sys.argv[1].split(',')
+pad = sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc)
+for _ in range(200):
+    print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
+" "${STORES[*]// /,}" "$PAD" | \
+        kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
+          rpk topic produce "$TOPIC" &>/dev/null || true
+      BIDX=$(( (BIDX + 1) % 3 ))
+    done
+  ) &
+  echo $!
+}
+
+cmd_load() {
+  if _load_running; then
+    ok "Load generator already running (PID $(cat "$LOAD_PID_FILE")) — ~500 KB/s to $CONTEXT_A"
+    return 0
+  fi
+  banner "Background Load Generator"
+  info "Continuous ~500 KB/s producer → $CONTEXT_A → ShadowLink → all regions"
+  info "Leave this running throughout the demo for live Grafana data."
+  echo ""
+  PROD_PID=$(_start_producer_bg)
+  echo "$PROD_PID" > "$LOAD_PID_FILE"
+  disown "$PROD_PID" 2>/dev/null || true
+  ok "Load generator started (PID $PROD_PID)"
+  info "Stop with: ./demo.sh stop-load"
+}
+
+cmd_stop_load() {
+  if ! _load_running; then
+    info "No load generator running."
+    return 0
+  fi
+  LPID=$(cat "$LOAD_PID_FILE")
+  kill "$LPID" 2>/dev/null || true
+  wait "$LPID" 2>/dev/null || true
+  rm -f "$LOAD_PID_FILE"
+  ok "Load generator stopped."
 }
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -721,31 +785,17 @@ cmd_upgrade() {
   info "open a PR — the Operator handles the rolling restart. No manual broker interaction."
   echo ""
 
-  step "1. Starting continuous background producer (~500 KB/s)..."
-  (
-    STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
-    PAD=$(python3 -c "print('x'*2300)")
-    BIDX=0
-    while true; do
-      BROKER="redpanda-${BIDX}"
-      python3 -c "
-import random, datetime, json, sys, signal
-signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-stores = sys.argv[1].split(',')
-pad = sys.argv[2]
-now = datetime.datetime.now(datetime.timezone.utc)
-for _ in range(200):
-    print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
-" "${STORES[*]// /,}" "$PAD" | \
-        kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
-          rpk topic produce "$TOPIC" &>/dev/null || true
-      BIDX=$(( (BIDX + 1) % 3 ))
-    done
-  ) &
-  PROD_PID=$!
-  disown $PROD_PID 2>/dev/null || true
-  trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
-  ok "Producer running in background (PID $PROD_PID) — ~200 records/batch × ~2.5 KB each (~500 KB/s)"
+  step "1. Background producer..."
+  OWN_PRODUCER=false
+  if _load_running; then
+    ok "Global load generator running (PID $(cat "$LOAD_PID_FILE")) — ~500 KB/s already flowing"
+  else
+    PROD_PID=$(_start_producer_bg)
+    disown "$PROD_PID" 2>/dev/null || true
+    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+    OWN_PRODUCER=true
+    ok "Producer started (PID $PROD_PID) — ~500 KB/s"
+  fi
   echo ""
 
   step "2. Pre-upgrade baseline..."
@@ -800,8 +850,10 @@ for _ in range(200):
   POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
   MSGS_DURING=$(( POST_HWM - PRE_HWM ))
-  kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true
-  trap - EXIT
+  if [[ "$OWN_PRODUCER" == "true" ]]; then
+    kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true
+    trap - EXIT
+  fi
 
   ELAPSED=$(( SECONDS - UPGRADE_START ))
   BYTES_DURING=$(( MSGS_DURING * 2500 ))
@@ -995,32 +1047,18 @@ cmd_chaos() {
   step "Action   : Kill redpanda-0, watch Raft re-elect, measure recovery time"
   echo ""
 
-  step "1. Starting continuous background producer (~500 KB/s)..."
-  (
-    STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
-    PAD=$(python3 -c "print('x'*2300)")
-    BIDX=0
-    while true; do
-      BROKER="redpanda-${BIDX}"
-      python3 -c "
-import random, datetime, json, sys, signal
-signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-stores = sys.argv[1].split(',')
-pad = sys.argv[2]
-now = datetime.datetime.now(datetime.timezone.utc)
-for _ in range(200):
-    print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
-" "${STORES[*]// /,}" "$PAD" | \
-        kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
-          rpk topic produce "$TOPIC" &>/dev/null || true
-      BIDX=$(( (BIDX + 1) % 3 ))
-    done
-  ) &
-  PROD_PID=$!
-  disown $PROD_PID 2>/dev/null || true
-  trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
-  ok "Producer running in background (PID $PROD_PID)"
-  sleep 3
+  step "1. Background producer..."
+  OWN_PRODUCER=false
+  if _load_running; then
+    ok "Global load generator running (PID $(cat "$LOAD_PID_FILE")) — ~500 KB/s already flowing"
+  else
+    PROD_PID=$(_start_producer_bg)
+    disown "$PROD_PID" 2>/dev/null || true
+    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+    OWN_PRODUCER=true
+    ok "Producer started (PID $PROD_PID) — ~500 KB/s"
+    sleep 3
+  fi
   echo ""
 
   step "2. ShadowLink lag before kill:"
@@ -1074,8 +1112,10 @@ for _ in range(200):
     RTO=$(( SECONDS - CHAOS_START ))
     POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
       | awk 'NR>1 {sum += $NF} END {print sum+0}')
-    kill $PROD_PID 2>/dev/null || true
-    trap - EXIT
+    if [[ "$OWN_PRODUCER" == "true" ]]; then
+      kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true
+      trap - EXIT
+    fi
     MSGS_DURING=$(( POST_HWM - PRE_HWM ))
     BYTES_DURING=$(( MSGS_DURING * 2500 ))
     KBPS=$(( RTO > 0 ? BYTES_DURING / RTO / 1024 : 0 ))
@@ -1219,6 +1259,8 @@ cmd_restore() {
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 case "${1:-}" in
   preflight)      cmd_preflight ;;
+  load)           cmd_load ;;
+  stop-load)      cmd_stop_load ;;
   produce)        cmd_produce "${2:-10}" ;;
   consume-source) cmd_consume_source ;;
   consume-shadow) cmd_consume_shadow ;;

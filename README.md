@@ -37,9 +37,12 @@ ShadowLink filter policy (identical on both destination clusters):
 
 ```bash
 ./demo.sh preflight
+./demo.sh load
 ```
 
-Checks all pods, ShadowLink state, topics, and prints Console + Grafana URLs. Fix anything red before proceeding.
+`preflight` checks all pods, ShadowLink state, topics, and prints Console + Grafana URLs. Fix anything red before proceeding.
+
+`load` starts the persistent ~500 KB/s background producer against `retail-orders` on eu-west-1. Leave it running for the entire demo — `chaos` and `upgrade` detect it automatically and won't spawn their own. Stop it at the end with `./demo.sh stop-load`.
 
 **Open in browser:**
 - Console eu-west-1 (`:8080`)
