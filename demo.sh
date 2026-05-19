@@ -408,23 +408,38 @@ cmd_consume_shadow() {
     --format '%v\n'
 }
 
+_consume_cleanup() {
+  trap - INT TERM EXIT
+  echo ""
+  echo "Stopping consumers..."
+  # Kill every kubectl exec and perl formatter spawned by this PID's subshells.
+  pkill -P $$ 2>/dev/null
+  # Belt and braces: kill the kubectl exec processes by exact arg pattern.
+  pkill -f "kubectl --context rp-demo-(eu-west-1|eu-central-1|europe-west4).*topic consume" 2>/dev/null
+  pkill -f "perl -e.*last_print" 2>/dev/null
+  # Give them a moment, then escalate.
+  sleep 1
+  pkill -KILL -f "kubectl --context rp-demo-(eu-west-1|eu-central-1|europe-west4).*topic consume" 2>/dev/null
+  pkill -KILL -f "perl -e.*last_print" 2>/dev/null
+  exit 0
+}
+
 cmd_consume_both() {
   banner "Consuming from BOTH clusters (split terminal view)"
-  info "Showing live messages from end of topic. Kill with Ctrl+C."
+  info "Showing live messages from end of topic. Press Ctrl+C to stop."
   info "(_pad field stripped — actual messages are ~2.5 KB each)"
   echo ""
+
+  trap _consume_cleanup INT TERM EXIT
 
   ( kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
       rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
     | _consume_format "eu-west-1" ) &
-  PID_A=$!
 
   ( kubectl --context "$CONTEXT_B" -n redpanda exec -i redpanda-0 -c redpanda -- \
       rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
     | _consume_format "eu-central-1" ) &
-  PID_B=$!
 
-  trap "kill $PID_A $PID_B 2>/dev/null; exit 0" INT TERM
   wait
 }
 
@@ -479,26 +494,24 @@ _consume_format() {
 
 cmd_consume_all() {
   banner "Consuming from ALL THREE clusters (split terminal view)"
-  info "Showing live messages from end of topic. Kill with Ctrl+C."
+  info "Showing live messages from end of topic. Press Ctrl+C to stop."
   info "(_pad field stripped — actual messages are ~2.5 KB each)"
   echo ""
+
+  trap _consume_cleanup INT TERM EXIT
 
   ( kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
       rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
     | _consume_format "eu-west-1" ) &
-  PID_A=$!
 
   ( kubectl --context "$CONTEXT_B" -n redpanda exec -i redpanda-0 -c redpanda -- \
       rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
     | _consume_format "eu-central-1" ) &
-  PID_B=$!
 
   ( kubectl --context "$CONTEXT_C" -n redpanda exec -i redpanda-0 -c redpanda -- \
       rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
     | _consume_format "europe-west4" ) &
-  PID_C=$!
 
-  trap "kill $PID_A $PID_B $PID_C 2>/dev/null; exit 0" INT TERM
   wait
 }
 
