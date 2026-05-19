@@ -443,18 +443,38 @@ cmd_consume_gcp() {
 }
 
 _consume_format() {
-  # Reads partition|offset|json-value lines, strips _pad, prefixes region.
+  # Throttles to ~1 sample/sec per region, with a rolling rate summary every 5s.
   local region="$1"
-  awk -v r="$region" '{
-    # split into p | o | json
-    n=index($0,"|"); p=substr($0,1,n-1); rest=substr($0,n+1);
-    n2=index(rest,"|"); o=substr(rest,1,n2-1); v=substr(rest,n2+1);
-    # strip ,_pad ... pattern in any position
-    gsub(/, *"_pad" *: *"x+"/, "", v);
-    gsub(/"_pad" *: *"x+" *,? */, "", v);
-    printf "[%-12s] p%s o=%s %s\n", r, p, o, v;
-    fflush();
-  }'
+  perl -e '
+    use strict; use warnings;
+    $| = 1;  # autoflush
+    my $r = shift;
+    my $last_print = 0;
+    my $last_summary = time();
+    my ($count, $bytes) = (0, 0);
+    while (my $line = <STDIN>) {
+      chomp $line;
+      $count++;
+      $bytes += length($line);
+      my $now = time();
+      if ($now > $last_print) {
+        my ($p, $o, $v) = split(/\|/, $line, 3);
+        if (defined $v) {
+          $v =~ s/, *"_pad" *: *"x+"//g;
+          $v =~ s/"_pad" *: *"x+" *,? *//g;
+          printf "[%-12s] p%s o=%s %s\n", $r, $p, $o, $v;
+        }
+        $last_print = $now;
+      }
+      if ($now - $last_summary >= 5) {
+        my $elapsed = $now - $last_summary;
+        my $kbps = int($bytes / 1024 / $elapsed);
+        printf "[%-12s] ── %d msgs in %ds (~%d KB/s sustained) ──\n",
+               $r, $count, $elapsed, $kbps;
+        ($count, $bytes, $last_summary) = (0, 0, $now);
+      }
+    }
+  ' -- "$region"
 }
 
 cmd_consume_all() {
