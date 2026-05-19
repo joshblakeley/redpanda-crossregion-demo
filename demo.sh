@@ -131,6 +131,8 @@ _start_producer_bg() {
   # Round-robins across all three brokers so one restarting doesn't stall throughput.
   (
     STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
+    STORES_JOINED="${STORES[*]}"
+    STORES_CSV="${STORES_JOINED// /,}"
     PAD=$(python3 -c "print('x'*2300)")
     BIDX=0
     while true; do
@@ -143,7 +145,7 @@ pad = sys.argv[2]
 now = datetime.datetime.now(datetime.timezone.utc)
 for _ in range(200):
     print(json.dumps({'order_id':f'ORD-{random.randint(0,99999):05d}','store':random.choice(stores),'amount':round(random.uniform(9,500),2),'ts':now.strftime('%Y-%m-%dT%H:%M:%SZ'),'_pad':pad}))
-" "${STORES[*]// /,}" "$PAD" | \
+" "$STORES_CSV" "$PAD" | \
         kubectl --context "$CONTEXT_A" -n redpanda exec -i "$BROKER" -c redpanda -- \
           rpk topic produce "$TOPIC" &>/dev/null || true
       BIDX=$(( (BIDX + 1) % 3 ))
@@ -408,19 +410,18 @@ cmd_consume_shadow() {
 
 cmd_consume_both() {
   banner "Consuming from BOTH clusters (split terminal view)"
-  info "Starting consumers on both clusters. Kill with Ctrl+C."
+  info "Showing live messages from end of topic. Kill with Ctrl+C."
+  info "(_pad field stripped — actual messages are ~2.5 KB each)"
   echo ""
 
-  kubectl --context "$CONTEXT_A" -n redpanda exec -it redpanda-0 -c redpanda -- \
-    rpk topic consume "$TOPIC" \
-    --group "$GROUP-source" \
-    --format "[eu-west-1]  %v\n" &
+  ( kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
+      rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
+    | _consume_format "eu-west-1" ) &
   PID_A=$!
 
-  kubectl --context "$CONTEXT_B" -n redpanda exec -it redpanda-0 -c redpanda -- \
-    rpk topic consume "$TOPIC" \
-    --group "$GROUP-shadow" \
-    --format "[eu-central-1] %v\n" &
+  ( kubectl --context "$CONTEXT_B" -n redpanda exec -i redpanda-0 -c redpanda -- \
+      rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
+    | _consume_format "eu-central-1" ) &
   PID_B=$!
 
   trap "kill $PID_A $PID_B 2>/dev/null; exit 0" INT TERM
@@ -441,27 +442,40 @@ cmd_consume_gcp() {
     --format '%v\n'
 }
 
+_consume_format() {
+  # Reads partition|offset|json-value lines, strips _pad, prefixes region.
+  local region="$1"
+  awk -v r="$region" '{
+    # split into p | o | json
+    n=index($0,"|"); p=substr($0,1,n-1); rest=substr($0,n+1);
+    n2=index(rest,"|"); o=substr(rest,1,n2-1); v=substr(rest,n2+1);
+    # strip ,_pad ... pattern in any position
+    gsub(/, *"_pad" *: *"x+"/, "", v);
+    gsub(/"_pad" *: *"x+" *,? */, "", v);
+    printf "[%-12s] p%s o=%s %s\n", r, p, o, v;
+    fflush();
+  }'
+}
+
 cmd_consume_all() {
   banner "Consuming from ALL THREE clusters (split terminal view)"
-  info "Starting consumers on all three clusters. Kill with Ctrl+C."
+  info "Showing live messages from end of topic. Kill with Ctrl+C."
+  info "(_pad field stripped — actual messages are ~2.5 KB each)"
   echo ""
 
-  kubectl --context "$CONTEXT_A" -n redpanda exec -it redpanda-0 -c redpanda -- \
-    rpk topic consume "$TOPIC" \
-    --group "$GROUP-source" \
-    --format "[eu-west-1]      %v\n" &
+  ( kubectl --context "$CONTEXT_A" -n redpanda exec -i redpanda-0 -c redpanda -- \
+      rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
+    | _consume_format "eu-west-1" ) &
   PID_A=$!
 
-  kubectl --context "$CONTEXT_B" -n redpanda exec -it redpanda-0 -c redpanda -- \
-    rpk topic consume "$TOPIC" \
-    --group "$GROUP-shadow" \
-    --format "[eu-central-1]   %v\n" &
+  ( kubectl --context "$CONTEXT_B" -n redpanda exec -i redpanda-0 -c redpanda -- \
+      rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
+    | _consume_format "eu-central-1" ) &
   PID_B=$!
 
-  kubectl --context "$CONTEXT_C" -n redpanda exec -it redpanda-0 -c redpanda -- \
-    rpk topic consume "$TOPIC" \
-    --group "$GROUP-gcp" \
-    --format "[europe-west4]   %v\n" &
+  ( kubectl --context "$CONTEXT_C" -n redpanda exec -i redpanda-0 -c redpanda -- \
+      rpk topic consume "$TOPIC" --offset end --format '%p|%o|%v\n' 2>/dev/null \
+    | _consume_format "europe-west4" ) &
   PID_C=$!
 
   trap "kill $PID_A $PID_B $PID_C 2>/dev/null; exit 0" INT TERM
