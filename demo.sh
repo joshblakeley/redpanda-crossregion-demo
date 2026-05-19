@@ -1050,21 +1050,31 @@ cmd_routing() {
   echo ""
   echo ""
 
-  step "5. Data residency enforcement result — eu-central-1 after sync:"
-  SHADOW_TOPICS=$(rp_exec "$CONTEXT_B" rpk topic list 2>/dev/null || echo "")
-
-  if echo "$SHADOW_TOPICS" | grep -q "$EU_TOPIC"; then
-    ok "  $EU_TOPIC  → REPLICATED ✓  (matches include-all rule)"
-  else
-    echo -e "  ${YELLOW}$EU_TOPIC → not yet synced (retry in a few seconds)${NC}"
-  fi
-
-  if echo "$SHADOW_TOPICS" | grep -q "$CN_TOPIC"; then
-    echo -e "  ${RED}  $CN_TOPIC → REPLICATED (unexpected — check filter config)${NC}"
-  else
-    ok "  $CN_TOPIC → LOCAL ONLY ✓  (matched 'regional-' exclude rule)"
-  fi
+  step "5. Data residency enforcement — both shadow clusters after sync:"
+  info "  Same filter policy YAML applied on both DR clusters — identical enforcement"
+  info "  across AWS and GCP. No cloud-specific override anywhere."
   echo ""
+  for SHADOW_CTX in "$CONTEXT_B" "$CONTEXT_C"; do
+    case "$SHADOW_CTX" in
+      "$CONTEXT_B") REGION_LABEL="eu-central-1 (AWS)" ;;
+      "$CONTEXT_C") REGION_LABEL="europe-west4 (GCP)" ;;
+    esac
+    info "  ── $REGION_LABEL ──"
+    SHADOW_TOPICS=$(rp_exec "$SHADOW_CTX" rpk topic list 2>/dev/null || echo "")
+
+    if echo "$SHADOW_TOPICS" | grep -q "^$EU_TOPIC"; then
+      ok "      $EU_TOPIC  → REPLICATED ✓  (matches include-all rule)"
+    else
+      echo -e "  ${YELLOW}    $EU_TOPIC → not yet synced (retry in a few seconds)${NC}"
+    fi
+
+    if echo "$SHADOW_TOPICS" | grep -q "^$CN_TOPIC"; then
+      echo -e "  ${RED}    $CN_TOPIC → REPLICATED (unexpected — check filter config)${NC}"
+    else
+      ok "      $CN_TOPIC → LOCAL ONLY ✓  (matched 'regional-' exclude rule)"
+    fi
+    echo ""
+  done
 
   step "6. This policy is a two-line YAML block in Git:"
   echo "     autoCreateShadowTopicFilters:"
@@ -1086,11 +1096,12 @@ cmd_routing() {
   echo ""
 
   banner "Routing Demo Complete"
-  ok "Policy-based selective distribution confirmed:"
-  info "  global-*   topics → replicated to all regions"
-  info "  regional-* topics → scoped to origin region only"
+  ok "Policy-based selective distribution confirmed across AWS + GCP:"
+  info "  global-*   topics → replicated to eu-central-1 (AWS) AND europe-west4 (GCP)"
+  info "  regional-* topics → scoped to origin region only (eu-west-1)"
   info ""
   info "Policy-as-code beats a routing UI — every change is a PR with reviewer + audit trail"
+  info "Identical filter YAML enforces residency the same way on both clouds"
   info "Data residency enforcement at broker layer satisfies regulatory requirements automatically"
   info ""
   info "To clean up:"
