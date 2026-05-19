@@ -1085,8 +1085,8 @@ cmd_routing() {
   rp_exec "$CONTEXT_A" rpk topic list 2>&1 | grep -E "$EU_TOPIC|$CN_TOPIC" || echo "  (topics created)"
   echo ""
 
-  step "4. Waiting 35s for ShadowLink sync cycle (30s interval + buffer)..."
-  for i in $(seq 35 -1 1); do
+  step "4. Waiting 10s for ShadowLink sync cycle (5s interval + buffer)..."
+  for i in $(seq 10 -1 1); do
     printf "\r  %2ds remaining — ShadowLink evaluating filter policy..." "$i"
     sleep 1
   done

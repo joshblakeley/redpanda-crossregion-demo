@@ -20,7 +20,7 @@ spec:
               name: eu-west-1-ca-cert
               key: ca.crt
   topicMetadataSyncOptions:
-    interval: 30s
+    interval: 5s
     autoCreateShadowTopicFilters:
       - name: "regional-"
         filterType: exclude
@@ -29,6 +29,6 @@ spec:
         filterType: include
         patternType: literal
   consumerOffsetSyncOptions:
-    interval: 30s
+    interval: 5s
   schemaRegistrySyncOptions:
     schema_registry_shadowing_mode: topic
