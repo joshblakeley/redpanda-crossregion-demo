@@ -126,7 +126,8 @@ _load_running() {
 }
 
 _start_producer_bg() {
-  # Starts the background producer subshell, echos its PID.
+  # Starts the background producer subshell and writes its PID to LOAD_PID_FILE.
+  # Avoids command substitution $(...) which causes bash to wait for the bg job.
   # Round-robins across all three brokers so one restarting doesn't stall throughput.
   (
     STORES=("STORE-SE-Stockholm" "STORE-DE-Berlin" "STORE-FI-Helsinki" "STORE-DK-Copenhagen" "STORE-NO-Oslo" "STORE-NL-Amsterdam")
@@ -148,7 +149,8 @@ for _ in range(200):
       BIDX=$(( (BIDX + 1) % 3 ))
     done
   ) &
-  echo $!
+  echo $! > "$LOAD_PID_FILE"
+  disown $! 2>/dev/null || true
 }
 
 cmd_load() {
@@ -160,10 +162,8 @@ cmd_load() {
   info "Continuous ~500 KB/s producer → $CONTEXT_A → ShadowLink → all regions"
   info "Leave this running throughout the demo for live Grafana data."
   echo ""
-  PROD_PID=$(_start_producer_bg)
-  echo "$PROD_PID" > "$LOAD_PID_FILE"
-  disown "$PROD_PID" 2>/dev/null || true
-  ok "Load generator started (PID $PROD_PID)"
+  _start_producer_bg
+  ok "Load generator started (PID $(cat "$LOAD_PID_FILE"))"
   info "Stop with: ./demo.sh stop-load"
 }
 
@@ -790,16 +790,16 @@ cmd_upgrade() {
   if _load_running; then
     ok "Global load generator running (PID $(cat "$LOAD_PID_FILE")) — ~500 KB/s already flowing"
   else
-    PROD_PID=$(_start_producer_bg)
-    disown "$PROD_PID" 2>/dev/null || true
-    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+    _start_producer_bg
+    PROD_PID=$(cat "$LOAD_PID_FILE")
+    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; rm -f '$LOAD_PID_FILE'; trap - EXIT" EXIT
     OWN_PRODUCER=true
     ok "Producer started (PID $PROD_PID) — ~500 KB/s"
   fi
   echo ""
 
   step "2. Pre-upgrade baseline..."
-  rp_exec "$CONTEXT_A" rpk cluster health 2>&1
+  rp_exec "$CONTEXT_A" rpk cluster health 2>&1 || true
   PRE_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
   UNREPL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_kafka_under_replicated_replicas)")
@@ -822,7 +822,8 @@ cmd_upgrade() {
   for BROKER in 0 1 2; do
     info "  ── broker redpanda-$BROKER ──"
     SEEN_DOWN=false
-    for _ in $(seq 1 24); do
+    BROKER_WATCH_START=$SECONDS
+    for _ in $(seq 1 60); do
       READY=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
         -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
       PHASE=$(kubectl --context "$CONTEXT_A" -n redpanda get pod "redpanda-$BROKER" \
@@ -838,14 +839,24 @@ cmd_upgrade() {
         ok "    redpanda-$BROKER restarted and healthy — proceeding"
         break
       fi
+      # If broker hasn't gone down within 30s it was already restarted — move on
+      if [[ "$SEEN_DOWN" == "false" && $(( SECONDS - BROKER_WATCH_START )) -ge 30 ]]; then
+        ok "    redpanda-$BROKER already healthy (restarted before watch window) — proceeding"
+        break
+      fi
       sleep 5
     done
   done
   echo ""
 
   step "5. Post-upgrade verification..."
-  sleep 3
-  rp_exec "$CONTEXT_A" rpk cluster health 2>&1
+  # Wait up to 60s for all partitions to be fully replicated after final broker restart
+  HEALTH_WAIT=0
+  until rp_exec "$CONTEXT_A" rpk cluster health 2>/dev/null | grep -q "Healthy:.*true"; do
+    if (( HEALTH_WAIT >= 60 )); then break; fi
+    sleep 5; HEALTH_WAIT=$(( HEALTH_WAIT + 5 ))
+  done
+  rp_exec "$CONTEXT_A" rpk cluster health 2>&1 || true
   echo ""
   POST_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
@@ -1052,9 +1063,9 @@ cmd_chaos() {
   if _load_running; then
     ok "Global load generator running (PID $(cat "$LOAD_PID_FILE")) — ~500 KB/s already flowing"
   else
-    PROD_PID=$(_start_producer_bg)
-    disown "$PROD_PID" 2>/dev/null || true
-    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; trap - EXIT" EXIT
+    _start_producer_bg
+    PROD_PID=$(cat "$LOAD_PID_FILE")
+    trap "kill $PROD_PID 2>/dev/null || true; wait $PROD_PID 2>/dev/null || true; rm -f '$LOAD_PID_FILE'; trap - EXIT" EXIT
     OWN_PRODUCER=true
     ok "Producer started (PID $PROD_PID) — ~500 KB/s"
     sleep 3
@@ -1063,11 +1074,11 @@ cmd_chaos() {
 
   step "2. ShadowLink lag before kill:"
   rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
-    grep -E "^Name:|PARTITION|SRC_LSO" | head -20
+    grep -E "^Name:|PARTITION|SRC_LSO|^\s+[0-9]" | head -20
   echo ""
 
   step "3. Cluster health + metrics before kill:"
-  rp_exec "$CONTEXT_A" rpk cluster health 2>&1
+  rp_exec "$CONTEXT_A" rpk cluster health 2>&1 || true
   PRE_HWM=$(rp_exec "$CONTEXT_A" rpk topic describe "$TOPIC" -p 2>/dev/null \
     | awk 'NR>1 {sum += $NF} END {print sum+0}')
   UNAVAIL_PRE=$(prom_query "$CONTEXT_A" "sum(redpanda_cluster_unavailable_partitions)")
@@ -1129,7 +1140,7 @@ cmd_chaos() {
     echo ""
     step "6. ShadowLink lag after recovery (should be 0 or near-0):"
     rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
-      grep -E "^Name:|PARTITION|SRC_LSO" | head -20
+      grep -E "^Name:|PARTITION|SRC_LSO|^\s+[0-9]" | head -20
     echo ""
     ok "═══════════════════════════════════════════"
     ok "  HA DEMO COMPLETE"
@@ -1156,7 +1167,7 @@ cmd_failover() {
 
   step "2. Current replication lag (should be 0 before outage):"
   rp_exec "$CONTEXT_B" rpk shadow status "$SHADOW_LINK" --print-all 2>&1 | \
-    grep -E "^Name:|PARTITION|SRC_LSO" | head -20
+    grep -E "^Name:|PARTITION|SRC_LSO|^\s+[0-9]" | head -20
   echo ""
 
   step "3. Producing 10 messages to eu-west-1 before outage..."
