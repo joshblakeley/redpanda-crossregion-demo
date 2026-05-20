@@ -263,6 +263,9 @@ kubectl --context "$CONTEXT_B" apply -f clusters/region-b/amqp-bridge/rabbitmq.y
 kubectl --context "$CONTEXT_B" apply -f clusters/region-b/amqp-bridge/connect.yaml
 kubectl --context "$CONTEXT_B" apply -f clusters/region-b/amqp-bridge/amqp-consumer.yaml
 
+echo "==> Deploying GCP retail consumer on $CONTEXT_C (europe-west4)..."
+kubectl --context "$CONTEXT_C" apply -f clusters/region-c/python-consumer.yaml
+
 echo "==> Creating topics on eu-west-1..."
 kubectl --context "$CONTEXT_A" -n redpanda exec redpanda-0 -c redpanda -- \
   rpk topic create retail-orders iot-events --partitions 3 2>/dev/null || true

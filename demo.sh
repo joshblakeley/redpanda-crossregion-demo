@@ -89,7 +89,7 @@ usage() {
   echo "  mqtt-consume [source|shadow]  Consume iot-events as cloud-native Kafka client"
   echo "  mqtt-status            MQTT bridge and iot-events topic status"
   echo ""
-  echo "  python-consume [source|shadow]  Python confluent-kafka consumer (retail-orders)"
+  echo "  python-consume [source|shadow|gcp]  Python confluent-kafka consumer (retail-orders)"
   echo "  amqp-consume           AMQP 0.9.1 consumer — end of MQTT→Kafka→AMQP chain"
   echo "  amqp-status            RabbitMQ + AMQP bridge pipeline status"
   echo ""
@@ -257,6 +257,9 @@ cmd_preflight() {
       --field-selector=status.phase=Running --no-headers
   _chk "europe-west4 Console Running" \
     kubectl --context "$CONTEXT_C" -n redpanda get pod -l app.kubernetes.io/name=console \
+      --field-selector=status.phase=Running --no-headers
+  _chk "europe-west4 GCP retail consumer Running" \
+    kubectl --context "$CONTEXT_C" -n redpanda get pod -l app=gcp-retail-consumer \
       --field-selector=status.phase=Running --no-headers
   echo ""
 
@@ -765,9 +768,12 @@ cmd_mqtt_status() {
 cmd_python_consume() {
   local cluster="${1:-source}"
   local ctx="$CONTEXT_A"
-  local label="eu-west-1 (source)"
+  local label="eu-west-1 (source, AWS)"
   local deploy="python-retail-consumer"
-  [[ "$cluster" == "shadow" ]] && { ctx="$CONTEXT_B"; label="eu-central-1 (shadow)"; }
+  case "$cluster" in
+    shadow) ctx="$CONTEXT_B"; label="eu-central-1 (shadow, AWS)" ;;
+    gcp)    ctx="$CONTEXT_C"; label="europe-west4 (shadow, GCP)"; deploy="gcp-retail-consumer" ;;
+  esac
 
   banner "Python Kafka Consumer — $label"
   info "Client library : confluent-kafka (standard Kafka protocol)"

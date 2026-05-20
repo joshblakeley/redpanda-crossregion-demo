@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: python-consumer-script
+  namespace: redpanda
+data:
+  consumer.py: |
+    import json, os, signal, sys
+    from datetime import datetime, timezone
+    from confluent_kafka import Consumer, KafkaError, KafkaException
+
+    BROKER  = os.environ.get("KAFKA_BROKERS", "redpanda-0.redpanda.redpanda.svc.cluster.local:9092")
+    TOPIC   = os.environ.get("KAFKA_TOPIC",   "retail-orders")
+    GROUP   = os.environ.get("KAFKA_GROUP",   "gcp-retail-consumer")
+    CA_CERT = os.environ.get("KAFKA_CA_CERT", "/etc/redpanda-certs/ca.crt")
+    REGION  = os.environ.get("REGION_LABEL",  "europe-west4 (GCP)")
+
+    conf = {
+        "bootstrap.servers":  BROKER,
+        "group.id":           GROUP,
+        "auto.offset.reset":  "latest",
+        "security.protocol":  "SSL",
+        "ssl.ca.location":    CA_CERT,
+        "enable.auto.commit": True,
+    }
+
+    running = True
+
+    def shutdown(signum, frame):
+        global running
+        print("\n[consumer] Shutting down...", flush=True)
+        running = False
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    consumer = Consumer(conf)
+    consumer.subscribe([TOPIC])
+
+    print(f"[consumer] region   : {REGION}", flush=True)
+    print(f"[consumer] broker   : {BROKER}", flush=True)
+    print(f"[consumer] topic    : {TOPIC}", flush=True)
+    print(f"[consumer] group    : {GROUP}", flush=True)
+    print(f"[consumer] protocol : Kafka/TLS (confluent-kafka)", flush=True)
+    print(f"[consumer] Reading from latest. Cross-cloud consumer of replicated retail-orders.\n", flush=True)
+
+    try:
+        while running:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                raise KafkaException(msg.error())
+            ts  = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            key = msg.key().decode() if msg.key() else "-"
+            try:
+                value = json.loads(msg.value().decode("utf-8"))
+                # Strip _pad to keep logs readable
+                value.pop("_pad", None)
+                print(f"[{ts} {REGION}] p={msg.partition()} offset={msg.offset()} key={key} {json.dumps(value)}", flush=True)
+            except Exception:
+                print(f"[{ts} {REGION}] raw: {msg.value()}", flush=True)
+    finally:
+        consumer.close()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-retail-consumer
+  namespace: redpanda
+  labels:
+    app: gcp-retail-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gcp-retail-consumer
+  template:
+    metadata:
+      labels:
+        app: gcp-retail-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: python:3.11-slim
+          command: [sh, -c]
+          args:
+            - pip install confluent-kafka --quiet --disable-pip-version-check 2>/dev/null && python /app/consumer.py
+          env:
+            - name: KAFKA_BROKERS
+              value: redpanda-0.redpanda.redpanda.svc.cluster.local:9092
+            - name: KAFKA_TOPIC
+              value: retail-orders
+            - name: KAFKA_GROUP
+              value: gcp-retail-consumer
+            - name: KAFKA_CA_CERT
+              value: /etc/redpanda-certs/ca.crt
+            - name: REGION_LABEL
+              value: europe-west4-GCP
+          volumeMounts:
+            - name: script
+              mountPath: /app
+            - name: redpanda-certs
+              mountPath: /etc/redpanda-certs
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: script
+          configMap:
+            name: python-consumer-script
+        - name: redpanda-certs
+          secret:
+            secretName: redpanda-default-root-certificate
+            items:
+              - key: ca.crt
+                path: ca.crt
